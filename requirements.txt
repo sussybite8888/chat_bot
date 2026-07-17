@@ -1,0 +1,13 @@
+nltk>=3.9
+torch>=2.6
+transformers>=4.44
+datasets>=3.0
+numpy>=1.26
+rich>=13.7
+discord.py>=2.4
+fastapi>=0.115
+uvicorn>=0.30
+python-dotenv>=1.0
+
+# Optional: verify Google Chat request identity (recommended in production)
+# google-auth>=2.30
