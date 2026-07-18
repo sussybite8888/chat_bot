@@ -12,13 +12,15 @@ from .engine import BACKENDS, ChatEngine
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        prog="npschat", description="Chat with a GPT trained on the NPS Chat corpus."
+        prog="sodachat",
+        description="Chat with a small GPT trained from scratch on dialogue data.",
     )
     parser.add_argument("--once", metavar="MESSAGE", help="reply to one message and exit")
     parser.add_argument(
         "--unfiltered",
         action="store_true",
-        help="disable the profanity filter (the corpus is raw 2006 chat-room text)",
+        help="disable the profanity filter on replies (on by default, since a "
+        "generative model can produce anything)",
     )
     parser.add_argument("--plain", action="store_true", help="hide reply metadata")
     parser.add_argument("--seed", type=int, default=None, help="random seed")
@@ -61,7 +63,7 @@ def main(argv: list[str] | None = None) -> None:
             f"Chatting via the [bold]{engine.backend}[/] backend.\n"
             "Type [bold]/quit[/] (or Ctrl-D) to leave.",
             border_style="cyan",
-            title="npschat",
+            title="sodachat",
         )
     )
     while True:

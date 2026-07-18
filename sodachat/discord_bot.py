@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from .engine import ChatEngine
 
-log = logging.getLogger("npschat.discord")
+log = logging.getLogger("sodachat.discord")
 
 
 def _strip_mentions(content: str, bot_user: discord.ClientUser) -> str:
@@ -40,9 +40,9 @@ def main() -> None:
         )
 
     respond_all = os.environ.get("DISCORD_RESPOND_ALL", "").lower() in {"1", "true", "yes"}
-    filtered = os.environ.get("NPSCHAT_UNFILTERED", "").lower() not in {"1", "true", "yes"}
+    filtered = os.environ.get("SODACHAT_UNFILTERED", "").lower() not in {"1", "true", "yes"}
 
-    log.info("warming up on the NPS Chat corpus...")
+    log.info("loading the chat model...")
     engine = ChatEngine(filtered=filtered)
 
     intents = discord.Intents.default()

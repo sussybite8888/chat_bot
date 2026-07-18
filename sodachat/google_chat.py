@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from .engine import ChatEngine
 
-log = logging.getLogger("npschat.googlechat")
+log = logging.getLogger("sodachat.googlechat")
 
 _CHAT_ISSUER = "chat@system.gserviceaccount.com"
 
@@ -36,14 +36,14 @@ _histories: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=8))
 async def _lifespan(app: FastAPI):
     global engine
     load_dotenv()
-    filtered = os.environ.get("NPSCHAT_UNFILTERED", "").lower() not in {"1", "true", "yes"}
-    log.info("warming up on the NPS Chat corpus...")
+    filtered = os.environ.get("SODACHAT_UNFILTERED", "").lower() not in {"1", "true", "yes"}
+    log.info("loading the chat model...")
     engine = ChatEngine(filtered=filtered)
     log.info("engine ready")
     yield
 
 
-app = FastAPI(title="npschat Google Chat app", lifespan=_lifespan)
+app = FastAPI(title="sodachat Google Chat app", lifespan=_lifespan)
 
 
 def _verify_request(request: Request) -> None:
@@ -82,7 +82,7 @@ async def on_event(request: Request) -> dict:
     event_type = event.get("type")
 
     if event_type == "ADDED_TO_SPACE":
-        return {"text": "hey! i learned everything i know from 2006 chat rooms. say hi!"}
+        return {"text": "hey! i'm a small chatbot trained from scratch. say hi!"}
     if event_type == "MESSAGE":
         message = event.get("message", {})
         # argumentText excludes the leading @mention of the app, when present

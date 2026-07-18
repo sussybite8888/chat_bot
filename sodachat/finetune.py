@@ -1,6 +1,6 @@
 """Fine-tune a pretrained GPT-2-family model on a dialogue dataset.
 
-    python -m npschat_bot.finetune [--dataset dailydialog|nps] [--epochs 3]
+    python -m sodachat.finetune [--dataset dailydialog|nps] [--epochs 3]
 
 Dialogues are flattened to one utterance per line (an <|endoftext|> token
 between dialogues) and the model learns to continue the conversation. The

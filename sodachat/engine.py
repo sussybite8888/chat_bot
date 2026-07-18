@@ -4,7 +4,7 @@ Replies come from a language model that continues the chat stream: recent
 conversation lines go in, several candidate next lines are sampled out, and
 the most relevant candidate is returned.
 
-Backends (ChatEngine(backend=...), CLI --backend, or NPSCHAT_BACKEND):
+Backends (ChatEngine(backend=...), CLI --backend, or SODACHAT_BACKEND):
 - "mini" (default): a small GPT (~14M params, BPE subword vocabulary)
   trained from scratch on SODA (model.py / train.py) — ~200M tokens of
   narrative-grounded dialogue, roughly Chinchilla-optimal for this size.
@@ -100,7 +100,7 @@ def _load_backend(backend: str, model_path: Path | None):
         target = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         if not target.exists():
             print(
-                "[npschat] no trained model found — training the mini-GPT on "
+                "[sodachat] no trained model found — training the mini-GPT on "
                 "SODA now (one-time, several hours; see README)..."
             )
             from .train import train_model
@@ -116,7 +116,7 @@ def _load_backend(backend: str, model_path: Path | None):
             # side effect of launching a chat frontend.
             raise FileNotFoundError(
                 f"no fine-tuned GPT-2 model at {target}. Run "
-                "`python -m npschat_bot.finetune` on a machine with >=16GB "
+                "`python -m sodachat.finetune` on a machine with >=16GB "
                 "RAM or a GPU, or use the default mini backend."
             )
         return HFChatLM(target)
@@ -137,7 +137,7 @@ class ChatEngine:
             torch.manual_seed(seed)
         self._recent: deque[str] = deque(maxlen=8)
 
-        self.backend = (backend or os.environ.get("NPSCHAT_BACKEND", "mini")).lower()
+        self.backend = (backend or os.environ.get("SODACHAT_BACKEND", "mini")).lower()
         self._lm = _load_backend(self.backend, model_path)
 
     def _acceptable(self, candidate: str, user_text: str) -> bool:

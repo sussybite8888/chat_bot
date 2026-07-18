@@ -1,6 +1,6 @@
 """Train the from-scratch GPT on a dialogue dataset.
 
-    python -m npschat_bot.train [--dataset soda|dailydialog|nps] [--steps N]
+    python -m sodachat.train [--dataset soda|dailydialog|nps] [--steps N]
 
 Dialogues are rendered as tagged turns (see data.py), tokenized once into a
 flat uint16 file under models/, and trained on as random crops of that token

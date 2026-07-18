@@ -49,7 +49,7 @@ def null_prompt() -> str:
 
 
 def default_model_path(dataset: str = "soda") -> Path:
-    env = os.environ.get("NPSCHAT_MODEL_PATH")
+    env = os.environ.get("SODACHAT_MODEL_PATH")
     if env:
         return Path(env)
     return Path(__file__).resolve().parent.parent / "models" / f"minigpt-{dataset}.pt"
@@ -337,6 +337,41 @@ class MiniGPT(nn.Module):
                 break
             idx = torch.cat([idx, next_id], dim=1)
         return idx
+
+
+class MultiHeadGPT(MiniGPT):
+    """One shared transformer trunk, two output heads producing different things
+    from the same forward pass:
+
+    - the **LM head** (inherited, tied to the embeddings) predicts text tokens —
+      used to generate a running commentary or a chat reply;
+    - the **action head** predicts a game action from the trunk's hidden state.
+
+    So a single pass over a board-as-text observation yields *both* the move to
+    play (action head) and the words to say about it (LM head). The trunk is
+    shared, so the two tasks inform one representation.
+    """
+
+    def __init__(self, cfg: GPTConfig, n_actions: int):
+        super().__init__(cfg)
+        self.n_actions = n_actions
+        self.action_head = nn.Linear(cfg.n_embd, n_actions)
+        nn.init.normal_(self.action_head.weight, std=0.02)
+        nn.init.zeros_(self.action_head.bias)
+
+    def _trunk(self, idx: torch.Tensor) -> torch.Tensor:
+        x = self.drop(self.tok_emb(idx))
+        cos, sin = self._rope_for(idx.shape[1], x.device, x.dtype)
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        return self.ln_f(x)
+
+    def forward_both(
+        self, idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (lm_logits [B,T,V], action_logits [B,T,A]) — one trunk pass."""
+        x = self._trunk(idx)
+        return self.head(x), self.action_head(x)
 
 
 def save_checkpoint(

@@ -16,7 +16,7 @@ from .model import pick_device
 
 DEFAULT_HF_MODEL_DIR = Path(
     os.environ.get(
-        "NPSCHAT_HF_MODEL_DIR",
+        "SODACHAT_HF_MODEL_DIR",
         Path(__file__).resolve().parent.parent / "models" / "gpt2-dailydialog",
     )
 )

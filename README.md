@@ -1,7 +1,13 @@
-# npschat — a small neural chatbot, three frontends
+# sodachat — a small neural network you train yourself
 
-A chatbot you train yourself, with a terminal UI, a Discord bot, and a Google
-Chat app sharing one engine.
+A tiny GPT (~1–14M parameters), trained from scratch on your own machine, put
+to two uses that lean on its speed and small size:
+
+- **A chatbot** with a terminal UI, a Discord bot, and a Google Chat app
+  sharing one engine.
+- **A game controller** — the same architecture, small enough to pick an
+  action every frame, trained to play Snake, Pong, Dodge, and Tic-Tac-Toe. One
+  agent both chats and plays (see [Playing games](#playing-games)).
 
 Two model backends:
 
@@ -10,7 +16,7 @@ Two model backends:
 | `mini` (default) | A ~14M-param GPT (RoPE / RMSNorm / SwiGLU) with an 8k BPE subword vocabulary, both trained **from scratch** on [SODA](https://huggingface.co/datasets/allenai/soda) (~1.2M narrative-grounded dialogues, ~210M tokens) | Wants a GPU: ~6h. No pretrained weights anywhere. |
 | `gpt2` | GPT-2 (124M) fine-tuned on dialogue data | Opt-in: never started automatically |
 
-Select with `--backend` (CLI) or `NPSCHAT_BACKEND` (Discord / Google Chat).
+Select with `--backend` (CLI) or `SODACHAT_BACKEND` (Discord / Google Chat).
 Other datasets: `--dataset dailydialog`, or `--dataset nps` (char-level) for
 vintage 2006 chat-room flavor.
 
@@ -47,11 +53,18 @@ concatenated dialogues run together and the model learns that abruptly
 switching topic is a valid reply (this was a real bug here: 12.8% of training
 transitions were dialogue boundaries).
 
-At inference the conversation is rendered the same way, ending with `B: ` so
+At inference the conversation is rendered the same way, ending with `B:` so
 the model continues as the bot, and generation stops at the next newline or
 separator.
 
-The engine ([engine.py](npschat_bot/engine.py)) wraps that with:
+Note the missing space after `B:` — that is deliberate. Byte-level BPE folds
+a leading space into the following word (`" Electronic"` is a single token),
+so a trailing space would tokenize as a lone space token, a sequence that
+never follows `B:` in training. The model then emits word-*continuation*
+fragments: `"Electronic"` comes out as `"ronic"`. This bug is invisible in
+the loss and only shows up in generated text.
+
+The engine ([engine.py](sodachat/engine.py)) wraps that with:
 
 - **Conversation history** — the last few turns condition each generation
   (kept per terminal session / Discord channel / Google Chat space).
@@ -64,7 +77,7 @@ The engine ([engine.py](npschat_bot/engine.py)) wraps that with:
 - **Reply trimming** — generations are cut to their first sentence or two;
   sampled tails tend to wander.
 - **Output filtering** — a profanity filter is applied to replies by default.
-  Disable with `--unfiltered` (CLI) or `NPSCHAT_UNFILTERED=1`.
+  Disable with `--unfiltered` (CLI) or `SODACHAT_UNFILTERED=1`.
 
 ## Setup
 
@@ -74,15 +87,16 @@ python3 -m venv .venv
 cp .env.example .env   # then fill in tokens as needed
 ```
 
-Datasets download automatically (NPS Chat via NLTK, DailyDialog via the
-Hugging Face hub).
+Datasets download automatically on first use: SODA and DailyDialog from the
+Hugging Face hub, NPS Chat via NLTK (`pip install nltk`, only needed for
+`--dataset nps`).
 
 ## Training
 
 ```sh
-.venv/bin/python -m npschat_bot.train                    # mini-GPT on SODA (~6h on a GPU)
-.venv/bin/python -m npschat_bot.train --dataset dailydialog   # small/fast, lower quality
-.venv/bin/python -m npschat_bot.finetune                 # GPT-2 (needs >=16GB / GPU)
+.venv/bin/python -m sodachat.train                    # mini-GPT on SODA (~6h on a GPU)
+.venv/bin/python -m sodachat.train --dataset dailydialog   # small/fast, lower quality
+.venv/bin/python -m sodachat.finetune                 # GPT-2 (needs >=16GB / GPU)
 ```
 
 The dataset is tokenized once into a flat `uint16` file under `models/`
@@ -109,7 +123,7 @@ works — copy the repo over, run the same command, copy
 
 ```sh
 rsync -az --exclude .venv --exclude models ./ user@host:~/chat_bot/
-ssh user@host 'cd ~/chat_bot && nohup python3 -u -m npschat_bot.train > train.log 2>&1 &'
+ssh user@host 'cd ~/chat_bot && nohup python3 -u -m sodachat.train > train.log 2>&1 &'
 rsync -az user@host:~/chat_bot/models/minigpt-soda.pt ./models/
 ```
 
@@ -120,8 +134,8 @@ nothing — on a tight machine use `--batch-size 16`.
 ## Terminal chat
 
 ```sh
-.venv/bin/python -m npschat_bot                         # interactive
-.venv/bin/python -m npschat_bot --once "hey whats up"   # one-shot
+.venv/bin/python -m sodachat                         # interactive
+.venv/bin/python -m sodachat --once "hey whats up"   # one-shot
 ```
 
 Flags: `--backend mini|gpt2`, `--plain` (hide reply metadata),
@@ -138,7 +152,7 @@ Flags: `--backend mini|gpt2`, `--plain` (hide reply metadata),
 4. Run it:
 
    ```sh
-   .venv/bin/python -m npschat_bot.discord_bot
+   .venv/bin/python -m sodachat.discord_bot
    ```
 
 The bot replies to DMs and @mentions, keeping short per-channel history. Set
@@ -152,7 +166,7 @@ and renders the JSON it returns.
 1. Run the server (default port 8080, override with `GOOGLE_CHAT_PORT`):
 
    ```sh
-   .venv/bin/python -m npschat_bot.google_chat
+   .venv/bin/python -m sodachat.google_chat
    ```
 
 2. Expose it over public HTTPS — for local development:
@@ -178,18 +192,208 @@ curl -s -X POST localhost:8080/ -H 'Content-Type: application/json' \
   -d '{"type":"MESSAGE","message":{"text":"hello there"}}'
 ```
 
+## Playing games
+
+The same architecture, small enough to decide in ~1.6ms, also works as a game
+controller. `sodachat/games/` is a general framework: a game exposes an
+observation and the model predicts an action token, trained by **behaviour
+cloning** (a scripted expert plays thousands of games; the model learns to
+predict its move). No reinforcement learning, no pretrained weights — ~1M
+parameters, trained in minutes.
+
+Crucially, observations don't have to be bitmaps. Two modalities are built in:
+
+| Modality | Observation | Games | Encoded by |
+|---|---|---|---|
+| **grid** | a 2D board of symbols | `snake`, `pong`, `dodge` | one token per cell |
+| **text** | a plain-text state | `tictactoe` | character by character |
+
+| Game | Genre | The model must… |
+|---|---|---|
+| `snake` | pathfinding (grid) | reach food without trapping itself |
+| `pong` | tracking (grid) | move a paddle to intercept a bouncing ball |
+| `dodge` | avoidance (grid) | line up with the gap in descending walls |
+| `tictactoe` | symbolic (text) | play optimally from a text board — never lose |
+
+Because a text state is the same kind of token stream the chat model uses, one
+agent both converses *and* plays (see below).
+
+```sh
+.venv/bin/python -m sodachat.game_train --game snake      # train (snake/pong/dodge/tictactoe)
+.venv/bin/python -m sodachat.play       --game snake      # watch a grid game, live
+```
+
+`play` shows a HUD with the score and the model's decide time — typically
+~1.6ms/move, hundreds of moves per second, far faster than the frame rate.
+Add `--fps 0` to let it run flat out.
+
+### One agent: chat and play together
+
+`sodachat.agent` is a single interface that routes each message — an intent to
+play starts a game, everything else is chat:
+
+```sh
+.venv/bin/python -m sodachat.agent
+```
+
+```
+you › hi there
+bot › Not much, just relaxing. How about you?
+you › /play snake
+bot › Playing snake — I'll keep going on my own. /score, /state, /board, /watch…
+you › /score                       (a command → read from the game, not the model)
+bot › Score: 3.
+  snake: score 3   best 5   game #2
+you › /watch                       (stream the live board for a few seconds)
+      ┌──── playing live ────┐
+      │ · · @ o o · · * · ·  │   score 4   best 5   game #2
+      └──────────────────────┘
+you › nice moves!                  (plain text → the chat model)
+bot › Thanks! I'm trying.
+you › /stop
+bot › Stopped — best score was 5.
+```
+
+The interface has one rule: **plain text goes to the model**, and **game
+control is `/commands`** — `/play`, `/stop`, `/watch`, the exact, deterministic
+readouts `/score`, `/state`, `/board` (straight from the game object), and
+`/model`. `/help` lists them.
+
+`/model` shows the loaded models (params, architecture, training) and **switches
+which model powers the agent**: `/model specialist` (default) uses a separate
+model per task — the chat model, the reader, and a per-game player — while
+`/model unified` routes chat, reading, *and* game moves through a single 30M
+model trained on the whole mixture (all chat datasets + the reader task + the
+games). You can flip between them live and feel the trade-off: the specialists
+read the score exactly and move in ~1ms; the one model is more general but
+currently weaker at exact numeric reads and ~10× slower per move.
+
+Grid games (Snake, Pong, Dodge) **run continuously on their own** in a
+background thread once started — stepping and auto-restarting while you type — so
+`/score` always reflects the current moment. `/watch` streams the animated board
+for a few seconds (typing and a repainting board can't share a terminal without
+a full TUI, so the animation is on demand; `sodachat.play` is the standalone
+full-speed view). Tic-Tac-Toe is turn-based — type a cell number to move.
+
+### The model can read the game
+
+Ask about the game in plain English and a small **reader model** answers by
+reading the live state — "what's the score?" → *"you have 7 points."* The chat
+model can't do this (it was never trained to reference a score), so
+[reader.py](sodachat/reader.py) is a ~0.9M-param model trained to *read*: given
+the state written as fields (`score 7 length 4 food up`) and a question, it
+locates the field the question names and copies its value.
+
+It genuinely reads rather than memorizes — trained with the fields in random
+order and values spanning 0–99, and **verified on scores held out of training**
+(17, 33, 54, 76, 91), which it reports correctly despite never seeing them. It's
+also trained to stay silent on chit-chat and on fields a game doesn't have (ask
+Snake "whose turn?"), so those fall through to the chat model. During a game,
+plain-text questions run through the reader against the live state; `/score`
+remains for an exact, instant readout.
+
+### Controlling and talking at the same time (one model, two heads)
+
+The agent above *routes* between a chat model and game policies. A tighter
+form of the same idea is a **single model with two output heads** that fire on
+the same forward pass — control and text simultaneously, not either/or:
+
+```sh
+.venv/bin/python -m sodachat.narrate train    # ~a few minutes on CPU
+.venv/bin/python -m sodachat.narrate play     # watch it play Snake AND narrate
+```
+
+`MultiHeadGPT` ([model.py](sodachat/model.py)) is one shared transformer trunk
+with two heads:
+
+- an **action head** — a linear layer over the moves, read from the trunk's
+  hidden state, that decides where to go;
+- the **LM head** (tied to the embeddings) that generates a running commentary.
+
+Each tick, the board is rendered as text and passed through the trunk once; the
+action head picks the move while the LM head narrates it:
+
+```
+· · @ · · · · · · ·
+· · o · · · * · · ·
+· · o o · · · · · ·        💬 "food is up and right, turning up"
+· · · · · · · · · ·        score 3   move: up
+```
+
+The move is ready from that first forward pass (~1.6 ms); the words are then
+generated token by token from the LM head (~20–70 ms), so the action never
+waits on the narration. The action head plays a real game (Snake avg ~22,
+versus ~26 for the single-purpose model — a small cost for the shared trunk
+also learning to talk), and the commentary stays consistent with the move
+because both read the same encoding of the board.
+
+Training is multi-task: for each frame the action head is supervised by the
+scripted expert and the LM head by templated commentary derived from the game
+state, with the two losses summed over one sequence — so the shared trunk
+learns a representation that serves both. The commentary is trained-from-scratch
+narration, so it's simple and game-flavoured, not open-ended chat; the point is
+that both outputs come from one model at once.
+
+### Consistent latency (why real-time control works)
+
+For real-time control, *worst-case* latency matters more than the average — a
+single slow frame stutters or misses a deadline. `--bench` reports the full
+per-move distribution:
+
+```sh
+.venv/bin/python -m sodachat.play --game snake --bench
+```
+
+Measured on CPU (default), 20000 moves, GC paused as in play:
+
+| p50 | p99 | p99.9 | over 30 fps budget |
+|---|---|---|---|
+| 2.4 ms | 3.7 ms | 11.5 ms | 0.025% of frames |
+
+**The model's compute is consistent** — 99% of moves land within ~1.5 ms of the
+median, and the standard deviation is ~0.1 ms. That steadiness is engineered:
+the model is warmed up before the loop (so kernel compilation isn't an
+in-game outlier), the input tensor is reused, the cyclic garbage collector is
+paused during play (its pauses were a systematic multi-ms spike source), and
+it runs single-threaded on CPU. The GPU is counter-intuitively worse for a
+model this small — async kernel-launch variance gives it a much heavier tail
+(occasional tens-of-ms spikes) — so play defaults to CPU. Because the board is
+fixed-size, the sequence length, and thus the work per move, is constant.
+
+**The rare tail is the OS, not the model.** On a general-purpose OS, ~0.02% of
+frames are preempted by other processes and overrun their budget; the absolute
+max swings from ~5 ms to ~75 ms between runs purely from scheduling noise. Two
+things make this a non-issue: the fixed-timestep loop *absorbs* a slow frame
+(it resyncs to the next deadline instead of spiralling, so one late frame in
+thousands is imperceptible), and at typical rates (10–30 fps) the frame budget
+is many times the p99 anyway. Hard-real-time guarantees would need process
+priority pinning or an RTOS, which is out of scope for a terminal game.
+
+**Adding your own game** is one file: subclass `Game`, set `MODALITY`
+(`"grid"` or `"text"`), the action list, and implement `reset` / `observe` /
+`step` plus a scripted `expert` for the training data. Decorate it with
+`@register` and it's immediately trainable, playable, and available in the
+agent — nothing in the tokenizer, trainer, or UI is game-specific. See
+[games/snake.py](sodachat/games/snake.py) (grid) and
+[games/tictactoe.py](sodachat/games/tictactoe.py) (text) for the two patterns.
+
 ## Layout
 
 ```
-npschat_bot/
+sodachat/
   corpus.py       # load + clean the NPS Chat corpus
-  data.py         # dialogue dataset loaders (DailyDialog, NPS)
+  data.py         # dialogue dataset loaders (SODA, DailyDialog, NPS)
   model.py        # mini GPT (nanoGPT-style transformer) + BPE/char tokenizers
-  train.py        # mini-GPT training -> models/minigpt-dailydialog.pt
+  train.py        # mini-GPT training -> models/minigpt-soda.pt
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/
-  engine.py       # generation + dialogue-act model (shared brain)
-  cli.py          # terminal UI (rich)
-  discord_bot.py  # Discord frontend (discord.py)
+  engine.py       # chat generation + MMI relevance reranking
+  cli.py          # terminal chat UI (rich)
+  discord_bot.py  # Discord chat frontend (discord.py)
   google_chat.py  # Google Chat frontend (FastAPI webhook)
+  agent.py        # unified interface: chat (plain text) + /commands for games
+  reader.py       # small model that reads game state to answer questions
+  game_train.py   # behaviour-cloning trainer for game control
+  play.py         # real-time terminal UI for grid games (rich.Live)
+  games/          # pluggable games: core framework + snake/pong/dodge/tictactoe
 ```
