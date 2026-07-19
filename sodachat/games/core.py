@@ -40,6 +40,10 @@ class Game:
     MODALITY: str = "grid"  # "grid" or "text"
     ACTIONS: tuple[str, ...] = ()
     GLYPHS: dict[int, tuple[str, str]] = {}
+    # Whether the unified/expert training corpora include this game. Set False
+    # for held-out probe games (see sandbox.py) that must stay unseen so they
+    # measure zero-shot transfer, not memorization.
+    TRAINABLE: bool = True
 
     # grid modality
     SIZE: tuple[int, int] = (10, 10)

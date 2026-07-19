@@ -1,0 +1,273 @@
+"""Shared building blocks — the neural-net toolkit every model is built from.
+
+This module is **model-agnostic**: it holds the transformer primitives, the
+tokenizers, the device helper, and the vocab-tolerant weight loader that all of
+sodachat's models reuse. Nothing here is specific to chatting, reading, or
+playing — those live in the per-model files (see the MODEL MAP in
+`sodachat/__init__.py`).
+
+    building blocks   RMSNorm, RoPE, CausalSelfAttention, SwiGLU, Block
+    config            GPTConfig
+    tokenizers        CharTokenizer, BPETokenizer, tokenizer_from_payload
+    utilities         pick_device, pad_load
+
+The models assembled from these:
+    MiniGPT      (model.py)    — base decoder LM; reused by chat, reader,
+                                 game specialists, unified, instruct
+    MultiHeadGPT (narrate.py)  — MiniGPT + an action head
+    ExpertGPT    (expert.py)   — task-routed FFN experts + action head
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def pick_device() -> str:
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int
+    block_size: int = 256
+    n_layer: int = 4
+    n_head: int = 4
+    n_embd: int = 192
+    dropout: float = 0.1
+    rope_theta: float = 10000.0
+
+
+# ------------------------------------------------------------- tokenizers
+
+
+class CharTokenizer:
+    kind = "char"
+
+    def __init__(self, chars: list[str]):
+        self.chars = chars
+        self._stoi = {c: i for i, c in enumerate(chars)}
+
+    def __len__(self) -> int:
+        return len(self.chars)
+
+    def encode(self, text: str) -> list[int]:
+        # Characters unseen at training time are silently dropped.
+        return [self._stoi[c] for c in text if c in self._stoi]
+
+    def decode(self, ids: list[int]) -> str:
+        return "".join(self.chars[i] for i in ids)
+
+    def to_payload(self) -> dict:
+        return {"type": "char", "chars": self.chars}
+
+
+class BPETokenizer:
+    """Small byte-level BPE vocabulary trained on the training dialogues."""
+
+    kind = "bpe"
+
+    def __init__(self, tok):
+        self._tok = tok
+
+    @classmethod
+    def train(
+        cls, texts, vocab_size: int, special_tokens: list[str] | None = None
+    ) -> "BPETokenizer":
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+        tok = Tokenizer(models.BPE(unk_token=None))
+        # Special tokens must survive pre-tokenization as single units.
+        if special_tokens:
+            from tokenizers import AddedToken
+
+            tok.add_special_tokens(
+                [AddedToken(t, normalized=False, special=True) for t in special_tokens]
+            )
+        tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tok.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=vocab_size,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            special_tokens=special_tokens or [],
+        )
+        tok.train_from_iterator(texts, trainer)
+        return cls(tok)
+
+    def token_id(self, token: str) -> int:
+        tid = self._tok.token_to_id(token)
+        if tid is None:
+            raise KeyError(f"token {token!r} not in vocabulary")
+        return tid
+
+    def add_special(self, tokens: list[str]) -> int:
+        """Append new special tokens (kept as single units). Returns the new
+        vocab size. Existing ids are unchanged; new tokens get ids at the end,
+        so a model's embedding can be padded to match (see pad_load)."""
+        from tokenizers import AddedToken
+
+        self._tok.add_special_tokens(
+            [AddedToken(t, normalized=False, special=True) for t in tokens]
+        )
+        return self._tok.get_vocab_size()
+
+    def __len__(self) -> int:
+        return self._tok.get_vocab_size()
+
+    def encode(self, text: str) -> list[int]:
+        return self._tok.encode(text).ids
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        return [e.ids for e in self._tok.encode_batch_fast(texts)]
+
+    def decode(self, ids: list[int]) -> str:
+        return self._tok.decode(ids)
+
+    def to_payload(self) -> dict:
+        return {"type": "bpe", "json": self._tok.to_str()}
+
+
+def tokenizer_from_payload(payload: dict) -> CharTokenizer | BPETokenizer:
+    if payload["type"] == "char":
+        return CharTokenizer(payload["chars"])
+    if payload["type"] == "bpe":
+        from tokenizers import Tokenizer
+
+        return BPETokenizer(Tokenizer.from_str(payload["json"]))
+    raise ValueError(f"unknown tokenizer type {payload['type']!r}")
+
+
+# ----------------------------------------------------- transformer blocks
+
+
+class RMSNorm(nn.Module):
+    """Llama-style normalization: like LayerNorm without the mean-centering."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x.float() * norm).type_as(x) * self.weight
+
+
+def _rope_cache(
+    seq_len: int, head_dim: int, theta: float, device, dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+    )
+    angles = torch.outer(torch.arange(seq_len, device=device).float(), freqs)
+    return angles.cos().to(dtype), angles.sin().to(dtype)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x: (B, n_head, T, head_dim) — rotate each (even, odd) dimension pair by a
+    # position-dependent angle, so attention sees *relative* distance.
+    x1, x2 = x.chunk(2, dim=-1)
+    cos, sin = cos[None, None], sin[None, None]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.head_dim = cfg.n_embd // cfg.n_head
+        self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
+        self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
+        self.attn_dropout = cfg.dropout
+        self.resid_drop = nn.Dropout(cfg.dropout)
+
+    def forward(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=2)
+        shape = (B, T, self.n_head, self.head_dim)
+        q, k, v = (t.view(shape).transpose(1, 2) for t in (q, k, v))
+        q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        return self.resid_drop(self.proj(y))
+
+
+class SwiGLU(nn.Module):
+    """Gated feed-forward (Llama-style). Hidden width is 2/3 of the usual 4x
+    so the gate's extra matrix keeps the parameter count the same."""
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        hidden = int(2 / 3 * 4 * cfg.n_embd)
+        hidden += (-hidden) % 64  # round up for efficient matmuls
+        self.gate = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.up = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.n_embd, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        self.ln1 = RMSNorm(cfg.n_embd)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln2 = RMSNorm(cfg.n_embd)
+        self.mlp = SwiGLU(cfg)
+
+    def forward(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), cos, sin)
+        return x + self.mlp(self.ln2(x))
+
+
+# ------------------------------------------------- vocab-tolerant loading
+
+
+@torch.no_grad()
+def pad_load(model: nn.Module, state_dict: dict) -> dict:
+    """Load `state_dict` into `model`, tolerating a grown vocabulary.
+
+    A post-trained model may add tokens (a new task marker, instruction
+    vocabulary), so its embedding — and the tied LM head — are taller than the
+    source checkpoint's. For any parameter whose shape only grew, the
+    overlapping region is copied and the new rows keep their fresh init (the
+    source weights are "padded" up); everything else is copied outright. This
+    lets instruction post-training warm-start from the base model's weights.
+    """
+    target = model.state_dict()
+    stats = {"copied": 0, "padded": 0, "skipped": 0}
+    for key, src in state_dict.items():
+        dst = target.get(key)
+        if dst is None:
+            stats["skipped"] += 1
+            continue
+        if dst.shape == src.shape:
+            dst.copy_(src)
+            stats["copied"] += 1
+        elif dst.dim() == src.dim() and all(d >= s for d, s in zip(dst.shape, src.shape)):
+            region = tuple(slice(0, s) for s in src.shape)
+            dst[region].copy_(src)
+            stats["padded"] += 1
+        else:
+            stats["skipped"] += 1
+    model.load_state_dict(target)
+    return stats

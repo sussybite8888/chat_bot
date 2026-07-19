@@ -18,7 +18,7 @@ from .core import (
     register,
     tokenizer_for,
 )
-from . import dodge, pong, snake, tictactoe  # noqa: F401  (register built-ins)
+from . import dodge, pong, sandbox, snake, tictactoe  # noqa: F401  (register built-ins)
 
 __all__ = [
     "GAMES",

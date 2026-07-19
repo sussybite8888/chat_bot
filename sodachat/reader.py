@@ -30,7 +30,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .model import GPTConfig, MiniGPT, pick_device
+from .blocks import GPTConfig, pick_device
+from .model import MiniGPT
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "models" / "reader.pt"
 _MAX_LEN = 160

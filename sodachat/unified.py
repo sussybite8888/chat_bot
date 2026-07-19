@@ -33,7 +33,8 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.5")
 import numpy as np
 import torch
 
-from .model import BPETokenizer, GPTConfig, MiniGPT, pick_device, save_checkpoint
+from .blocks import BPETokenizer, GPTConfig, pick_device
+from .model import MiniGPT, save_checkpoint
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 DEFAULT_PATH = MODELS_DIR / "unified.pt"
@@ -82,6 +83,8 @@ def _game_docs(n_per_game: int, seed: int) -> Iterator[str]:
 
     rng = random.Random(seed)
     for name, cls in GAMES.items():
+        if not cls.TRAINABLE:  # held-out probe games (sandbox) stay unseen
+            continue
         made = 0
         while made < n_per_game:
             g = cls(seed=rng.randrange(1 << 30))
@@ -125,7 +128,7 @@ def prepare(cache: Path, seed: int, log) -> tuple[np.ndarray, np.ndarray, BPETok
     tok_path, meta_path = cache / "unified-tok.json", cache / "unified-meta.json"
     bins = {s: cache / f"unified-{s}.bin" for s in ("train", "val")}
     if all(p.exists() for p in (tok_path, meta_path, *bins.values())):
-        from .model import tokenizer_from_payload
+        from .blocks import tokenizer_from_payload
 
         tok = tokenizer_from_payload(json.loads(tok_path.read_text()))
         meta = json.loads(meta_path.read_text())
@@ -258,6 +261,14 @@ class UnifiedLM:
     def move(self, game_name: str, board: str, legal: list[str]) -> str:
         prompt = f"{GAME} {game_name}\n{board}\nmove:"
         out = self._gen(prompt, 4, 0.4, [self._nl, self._end]).strip()
+        return next((a for a in legal if out.startswith(a)), out.split()[0] if out else legal[0])
+
+    def instruct_move(self, game_name: str, board: str, instruction: str,
+                      legal: list[str]) -> str:
+        """Instruction-conditioned move (the VLA task). Requires a checkpoint
+        whose tokenizer has <|act|> — i.e. the instruction post-trained model."""
+        prompt = f"<|act|> {game_name} | goal: {instruction}\n{board}\nmove:"
+        out = self._gen(prompt, 4, 0.3, [self._nl, self._end]).strip()
         return next((a for a in legal if out.startswith(a)), out.split()[0] if out else legal[0])
 
 

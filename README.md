@@ -256,17 +256,31 @@ bot › Stopped — best score was 5.
 
 The interface has one rule: **plain text goes to the model**, and **game
 control is `/commands`** — `/play`, `/stop`, `/watch`, the exact, deterministic
-readouts `/score`, `/state`, `/board` (straight from the game object), and
-`/model`. `/help` lists them.
+readouts `/score`, `/state`, `/board`, `/model`, and `/stats` (generation speed:
+tok/s, ms/reply, frequency). `/help` lists them. Each reply also shows its
+speed inline.
 
 `/model` shows the loaded models (params, architecture, training) and **switches
-which model powers the agent**: `/model specialist` (default) uses a separate
-model per task — the chat model, the reader, and a per-game player — while
-`/model unified` routes chat, reading, *and* game moves through a single 30M
-model trained on the whole mixture (all chat datasets + the reader task + the
-games). You can flip between them live and feel the trade-off: the specialists
-read the score exactly and move in ~1ms; the one model is more general but
-currently weaker at exact numeric reads and ~10× slower per move.
+which model powers the agent**, live:
+
+- `/model expert` (default once trained) — **one model whose game and chat
+  weights are largely separate** (task-routed experts; see below). Chat and
+  reading flow through a *text* expert + the LM head; game moves flow through a
+  *game* expert + a dedicated action head that picks a move in a **single forward
+  pass**. Because the two tasks no longer share their feed-forward weights,
+  teaching it to play well stopped eroding its chat — the fix for the problems
+  the unified and instruct models had below. Moves are goal-conditioned: each
+  game uses its natural goal, or set one with `/goal` to steer it mid-game.
+- `/model specialist` — a separate model per task (chat model, reader,
+  per-game player). Best raw quality: exact reads, ~1ms moves.
+- `/model unified` — one 30M *dense* model trained on the whole mixture (all chat
+  datasets + reader + games). One set of weights juggles everything, so it chats
+  and reads well but plays weakly (games were a small slice of its training).
+- `/model instruct` — an earlier VLA-style post-train of the unified model
+  ([instruct.py](sodachat/instruct.py)): pad-loads its weights and adds
+  instruction-conditioning. Kept for comparison — it demonstrates goal-following
+  but its single shared FFN meant post-training for games regressed reading and
+  play. The expert model is that idea done right.
 
 Grid games (Snake, Pong, Dodge) **run continuously on their own** in a
 background thread once started — stepping and auto-restarting while you type — so
@@ -334,6 +348,61 @@ learns a representation that serves both. The commentary is trained-from-scratch
 narration, so it's simple and game-flavoured, not open-ended chat; the point is
 that both outputs come from one model at once.
 
+### One model, separated game and chat weights (task-routed experts)
+
+The unified model put *everything* — chat, reading, four games — through one set
+of weights, and games lost: they were a small slice of the data, so it chatted
+well but played weakly. The obvious fix (post-train it harder on games, as
+[instruct.py](sodachat/instruct.py) did) made it worse, because a single shared
+feed-forward network can't learn to play without overwriting what made it chat.
+That's **catastrophic interference**, and it's the real reason for splitting the
+model.
+
+`ExpertGPT` ([expert.py](sodachat/expert.py)) keeps *one* model but stops the
+game and chat parts from sharing so much. Attention, embeddings, and norms stay
+shared (they're task-general), but **each block's feed-forward network is split
+into two experts — a text expert and a game expert — and every token is routed
+to its task's expert**:
+
+```
+token ─▶ shared attention ─▶ ┌─ text token  ─▶ TEXT expert ─┐ ─▶ shared norm ─▶ ┌ LM head (chat/read)
+                             └─ game token  ─▶ GAME expert ─┘                   └ action head (moves)
+```
+
+Chat tokens and game tokens flow through *different* FFN weights, so the
+gradients from learning to play never touch the chat expert — and vice versa.
+Same idea as a Mixture-of-Experts, but routed by **task** (a per-token tag)
+rather than a learned gate, so it's deterministic and adds no routing cost. It's
+still one network with one warm-start: [expert.py](sodachat/expert.py) copies the
+unified model's shared weights and *duplicates* its single FFN into both experts,
+so each starts competent and then specializes.
+
+Two objectives train it at once: an **LM loss** on every token (routed to its
+expert) keeps chat and reading sharp, and an **action loss** on the game expert's
+`<|act|>` positions teaches board→move. Moves come off the action head in a
+single forward pass (no token-by-token generation), and they're
+**goal-conditioned** — the same board yields a different move for "eat the food"
+versus "go to the top left corner", the VLA property, folded into the one model
+instead of a separate post-train. It's the default in the agent (`/model expert`)
+once trained:
+
+```sh
+python -m sodachat.expert train --device cuda   # warm-starts from unified.pt
+python -m sodachat.expert eval --game snake      # mean score over episodes
+python -m sodachat.expert vla                     # zero-shot instruction-following probe
+```
+
+**Testing the instruction-following without training anything** — the `sandbox`
+game ([games/sandbox.py](sodachat/games/sandbox.py)) is a bare movement grid (one
+agent, one target) that exists purely to probe VLA transfer. The model *never
+trains on it*, but its moves (`up/down/left/right`) and goals ("go to the top
+left corner", "eat the food") are the ones it learned on Snake, and the board
+uses Snake's glyphs — so a goal-conditioned model obeys instructions on it
+zero-shot. `expert vla` measures the follow-rate; you can also `/play sandbox`
+in the agent and steer it live with `/goal`. Measured on the final model:
+directional goals ~83%, corner goals 100%, target goals 100% — instruction-
+following that generalizes to a game outside the training set.
+
 ### Consistent latency (why real-time control works)
 
 For real-time control, *worst-case* latency matters more than the average — a
@@ -379,12 +448,24 @@ agent — nothing in the tokenizer, trainer, or UI is game-specific. See
 
 ## Layout
 
+The package has a **MODEL MAP** at the top of [sodachat/__init__.py](sodachat/__init__.py)
+listing every model with its architecture, inference class, and checkpoint. The
+short version: `blocks.py` is the shared toolkit (no single model owns it),
+`model.py` holds the base `MiniGPT` that most models reuse, and each model's
+data/training/inference lives in its own file below.
+
 ```
 sodachat/
   corpus.py       # load + clean the NPS Chat corpus
   data.py         # dialogue dataset loaders (SODA, DailyDialog, NPS)
-  model.py        # mini GPT (nanoGPT-style transformer) + BPE/char tokenizers
-  train.py        # mini-GPT training -> models/minigpt-soda.pt
+  blocks.py       # SHARED toolkit: RMSNorm/RoPE/attention/SwiGLU/Block, GPTConfig,
+                  #   tokenizers, pick_device, pad_load — every model builds on these
+  model.py        # base decoder LM (MiniGPT) + chat model (MiniChatLM) + checkpoint I/O
+  train.py        # chat-model training -> models/minigpt-soda.pt
+  unified.py      # one 30M dense model on the whole mixture -> models/unified.pt
+  instruct.py     # VLA-style instruction post-train -> models/unified-instruct.pt
+  expert.py       # task-routed experts: 1 model, separate game/chat FFNs -> models/expert.pt
+  narrate.py      # multi-head model (MultiHeadGPT): action head + LM commentary in one pass
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/
   engine.py       # chat generation + MMI relevance reranking
@@ -396,4 +477,5 @@ sodachat/
   game_train.py   # behaviour-cloning trainer for game control
   play.py         # real-time terminal UI for grid games (rich.Live)
   games/          # pluggable games: core framework + snake/pong/dodge/tictactoe
+                  #   + sandbox (a no-train VLA test grid)
 ```

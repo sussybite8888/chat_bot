@@ -38,15 +38,8 @@ from .data import (
     nps_dialogues,
     soda_dialogues,
 )
-from .model import (
-    BPETokenizer,
-    CharTokenizer,
-    GPTConfig,
-    MiniGPT,
-    default_model_path,
-    pick_device,
-    save_checkpoint,
-)
+from .blocks import BPETokenizer, CharTokenizer, GPTConfig, pick_device
+from .model import MiniGPT, default_model_path, save_checkpoint
 
 # Model size and schedule per dataset. Dropout only earns its keep when the
 # model sees the data many times; at ~1 epoch over SODA there is nothing to
@@ -166,7 +159,7 @@ def _save_tokenizer(path: Path, tokenizer, meta: dict) -> None:
 
 
 def _load_tokenizer(path: Path, meta: dict):
-    from .model import tokenizer_from_payload
+    from .blocks import tokenizer_from_payload
 
     return tokenizer_from_payload(json.loads(path.read_text()))
 

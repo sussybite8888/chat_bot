@@ -27,7 +27,8 @@ import torch
 import torch.nn.functional as F
 
 from .games import GAMES, GamePlayer, evaluate_headless, generate_dataset
-from .model import GPTConfig, MiniGPT, pick_device, save_checkpoint
+from .blocks import GPTConfig, pick_device
+from .model import MiniGPT, save_checkpoint
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 

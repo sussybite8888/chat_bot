@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 from .game_train import game_model_path
 from .games import GAMES, GamePlayer, load_model
+
+_MODELS = Path(__file__).resolve().parent.parent / "models"
 
 
 def _match_game(name: str) -> str | None:
@@ -127,17 +130,60 @@ class _UnifiedPlayer:
         return move
 
 
+class _InstructPlayer:
+    """Instruction-conditioned mover: reads the agent's current goal each move,
+    so `/goal <instruction>` steers a running game (the VLA behaviour)."""
+
+    def __init__(self, lm, agent):
+        self.lm = lm
+        self.agent = agent
+        self.last_ms = 0.0
+
+    def act(self, game) -> str:
+        legal = [a for a in game.ACTIONS if game.legal(a)]
+        t0 = time.perf_counter()
+        move = self.lm.instruct_move(game.NAME, game.render(), self.agent.goal, legal)
+        self.last_ms = (time.perf_counter() - t0) * 1000
+        return move
+
+
+class _ExpertPlayer:
+    """Mover for the task-routed expert model: one forward pass through the game
+    expert + action head. Uses the game's natural goal unless the user set one
+    with /goal (then that steers the moves)."""
+
+    def __init__(self, lm, agent):
+        self.lm = lm
+        self.agent = agent
+        self.last_ms = 0.0
+
+    def act(self, game) -> str:
+        legal = [a for a in game.ACTIONS if game.legal(a)]
+        goal = self.agent.goal if self.agent.goal_set else None
+        t0 = time.perf_counter()
+        move = self.lm.move(game.NAME, game.render(), legal, goal=goal)
+        self.last_ms = (time.perf_counter() - t0) * 1000
+        return move
+
+
 class SodaAgent:
     def __init__(self, device: str = "cpu"):
         self.device = device
         self._chat = None
         self._reader = None
-        self._unified = None
-        self.mode = "specialist"  # "specialist" (separate models) or "unified"
+        self._lms: dict = {}  # UnifiedLM/ExpertLM cache, keyed by checkpoint path
+        # Default to the task-routed expert model once it's been trained; it
+        # chats, reads, and plays from one model with separated game/chat weights.
+        self.mode = "expert" if (_MODELS / "expert.pt").exists() else "specialist"
+        self.goal = "eat the food"  # instruction used for moves (instruct/expert)
+        self.goal_set = False  # True once the user picks a goal with /goal
         self.history: list[str] = []
         self.continuous: ContinuousGame | None = None  # running grid game
         self.game = None  # interactive text game (tic-tac-toe)
         self.player = None
+        self._counter = None  # tokenizer used only to count reply tokens
+        self.stats = {"replies": 0, "tokens": 0, "seconds": 0.0}
+        self.last = {"tokens": 0, "ms": 0.0, "tok_s": 0.0, "hz": 0.0}
 
     # -------------------------------------------------------------- routing
 
@@ -172,17 +218,33 @@ class SodaAgent:
             self._chat = ChatEngine()
         return self._chat
 
-    def _unified_lm(self):
-        if self._unified is None:
-            from .unified import DEFAULT_PATH, UnifiedLM
+    def _mode_path(self, mode: str | None = None):
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+        from .instruct import OUT_PATH
+        from .unified import DEFAULT_PATH
 
-            if not DEFAULT_PATH.exists():
-                return None
-            self._unified = UnifiedLM(DEFAULT_PATH, self.device)
-        return self._unified
+        return {"unified": DEFAULT_PATH, "instruct": OUT_PATH,
+                "expert": EXPERT_PATH}.get(mode or self.mode)
+
+    def _active_lm(self):
+        """The single model for the current mode (unified/instruct/expert), or
+        None for specialist mode. Cached per checkpoint path."""
+        path = self._mode_path()
+        if path is None or not path.exists():
+            return None
+        if path not in self._lms:
+            if self.mode == "expert":
+                from .expert import ExpertLM
+
+                self._lms[path] = ExpertLM(path, self.device)
+            else:
+                from .unified import UnifiedLM
+
+                self._lms[path] = UnifiedLM(path, self.device)
+        return self._lms[path]
 
     def _chat_reply(self, text: str) -> str:
-        if self.mode == "unified" and (lm := self._unified_lm()) is not None:
+        if (lm := self._active_lm()) is not None:  # unified or instruct mode
             reply = lm.chat(self.history, text)
             self.history.extend([text, reply])
             return reply
@@ -201,9 +263,15 @@ class SodaAgent:
         return None
 
     def _player_for(self, name: str):
-        """The mover for a game, per the current mode: the unified model, or the
-        game's specialist checkpoint."""
-        if self.mode == "unified" and (lm := self._unified_lm()) is not None:
+        """The mover for a game, per the current mode: the task-routed expert
+        (goal-conditioned game expert), the instruction model, the base unified
+        model, or the game's specialist."""
+        lm = self._active_lm()
+        if self.mode == "expert" and lm is not None:
+            return _ExpertPlayer(lm, self)
+        if self.mode == "instruct" and lm is not None:
+            return _InstructPlayer(lm, self)
+        if self.mode == "unified" and lm is not None:
             return _UnifiedPlayer(lm)
         path = game_model_path(name)
         if not path.exists():
@@ -252,7 +320,7 @@ class SodaAgent:
         facts = (self.continuous.facts() if self.continuous is not None
                  else self.game.facts())
         fields = _facts_to_fields(facts)
-        if self.mode == "unified" and (lm := self._unified_lm()) is not None:
+        if (lm := self._active_lm()) is not None:  # unified or instruct mode
             return lm.read(fields, text) or self._chat_reply(text)
         if self._reader is None:
             from .reader import Reader
@@ -290,32 +358,90 @@ class SodaAgent:
     def _cmd_games(self, arg: str) -> str:
         return "Games: " + ", ".join(GAMES) + "."
 
+    # ------------------------------------------------------------- stats
+
+    def _count_tokens(self, text: str) -> int:
+        if self._counter is None:
+            import torch
+
+            from .model import DEFAULT_MODEL_PATH, tokenizer_from_payload
+
+            ck = torch.load(DEFAULT_MODEL_PATH, map_location="cpu", weights_only=True)
+            self._counter = tokenizer_from_payload(ck["tokenizer"])
+        return max(1, len(self._counter.encode(text)))
+
+    def record(self, reply: str, seconds: float) -> None:
+        """Log the timing of one model reply (called by the terminal loop)."""
+        n = self._count_tokens(reply)
+        self.stats["replies"] += 1
+        self.stats["tokens"] += n
+        self.stats["seconds"] += seconds
+        self.last = {"tokens": n, "ms": seconds * 1000,
+                     "tok_s": n / max(seconds, 1e-9),
+                     "hz": 1.0 / max(seconds, 1e-9)}
+
+    def _cmd_stats(self, arg: str) -> str:
+        s = self.stats
+        if not s["replies"]:
+            return "No model replies yet."
+        return (f"session: {s['replies']} replies, {s['tokens']} tokens in "
+                f"{s['seconds']:.1f}s\n"
+                f"  avg {s['tokens'] / max(s['seconds'], 1e-9):.1f} tok/s | "
+                f"{s['seconds'] / s['replies'] * 1000:.0f} ms/reply | "
+                f"{s['replies'] / max(s['seconds'], 1e-9):.2f} replies/s\n"
+                f"  last: {self.last['tokens']} tok, {self.last['ms']:.0f} ms, "
+                f"{self.last['tok_s']:.1f} tok/s, {self.last['hz']:.1f} Hz")
+
     def _cmd_model(self, arg: str) -> str:
         a = arg.strip().lower()
+        if a in ("expert", "routed", "moe"):
+            return self._set_mode("expert")
         if a in ("unified", "one", "big"):
             return self._set_mode("unified")
+        if a in ("instruct", "instruction", "vla"):
+            return self._set_mode("instruct")
         if a in ("specialist", "specialists", "separate", "default"):
             return self._set_mode("specialist")
         if a:
-            return (f"Unknown model '{arg}'. Use /model unified or "
-                    f"/model specialist, or /model with no argument for info.")
+            return (f"Unknown model '{arg}'. Use /model expert | specialist | "
+                    f"unified | instruct, or /model with no argument for info.")
         return self._model_info()
 
     def _set_mode(self, mode: str) -> str:
-        if mode == "unified":
-            from .unified import DEFAULT_PATH
-
-            if not DEFAULT_PATH.exists():
-                return "No unified model trained yet (models/unified.pt not found)."
+        path = self._mode_path(mode)
+        if path is not None and not path.exists():
+            return f"No {mode} model trained yet ({path.name} not found)."
         self.mode = mode
         note = " (a running game keeps its current model until /stop + /play)" \
             if self.continuous is not None or self.game is not None else ""
+        if mode == "expert":
+            steer = (f"currently steering with goal {self.goal!r}" if self.goal_set
+                     else "each game uses its natural goal; /goal to steer")
+            return ("Now using the expert model — one model whose game and chat "
+                    "weights are separated (task-routed experts). Chat/read use the "
+                    f"text expert; moves use the game expert + action head ({steer})."
+                    + note)
         if mode == "unified":
             return ("Now using the unified model — one 30M model handles chat, "
                     "reading, and moves." + note)
+        if mode == "instruct":
+            return (f"Now using the instruction model — game moves follow a goal "
+                    f"(currently {self.goal!r}; change with /goal). Note: it reads "
+                    f"and plays worse than the others." + note)
         return "Now using the specialist models — a separate model per task." + note
 
+    def _cmd_goal(self, arg: str) -> str:
+        if arg.strip():
+            self.goal = arg.strip()
+            self.goal_set = True
+            return (f"Goal set to {self.goal!r} — steers game moves in the "
+                    f"expert and instruct models (/model expert | instruct).")
+        state = "steering moves" if self.goal_set else "not set (games use their natural goal)"
+        return f"Current goal: {self.goal!r} ({state}). Set with /goal <instruction>."
+
     def _model_info(self) -> str:
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+        from .instruct import OUT_PATH as INSTRUCT_PATH
         from .model import DEFAULT_MODEL_PATH
         from .reader import DEFAULT_PATH as READER_PATH
         from .unified import DEFAULT_PATH as UNIFIED_PATH
@@ -335,16 +461,21 @@ class SodaAgent:
                 f"{info['arch']}, vocab {info['vocab']}{val}{step}{tag}"
             )
 
+        row("expert", EXPERT_PATH, EXPERT_PATH in self._lms)
         row("chat", DEFAULT_MODEL_PATH, self._chat is not None)
         row("reader", READER_PATH, self._reader is not None)
-        row("unified", UNIFIED_PATH, self._unified is not None)
+        row("unified", UNIFIED_PATH, UNIFIED_PATH in self._lms)
+        row("instruct", INSTRUCT_PATH, INSTRUCT_PATH in self._lms)
         trained = [n for n in GAMES if game_model_path(n).exists()]
         lines.append(f"  games trained: {', '.join(trained) or 'none'}")
         active = (self.continuous.game_cls.NAME if self.continuous is not None
                   else self.game.NAME if self.game is not None else None)
         if active:
             lines.append(f"  active game: {active}")
-        lines.append("switch with: /model unified | /model specialist")
+        if self.mode in ("instruct", "expert"):
+            steer = "steering moves" if self.goal_set else "off; games use natural goal"
+            lines.append(f"  goal: {self.goal!r} ({steer}; /goal to change)")
+        lines.append("switch with: /model expert | specialist | unified | instruct")
         return "\n".join(lines)
 
     def _cmd_help(self, arg: str) -> str:
@@ -362,6 +493,8 @@ _COMMANDS = {
     "games": SodaAgent._cmd_games,
     "model": SodaAgent._cmd_model,
     "info": SodaAgent._cmd_model,
+    "goal": SodaAgent._cmd_goal,
+    "stats": SodaAgent._cmd_stats,
     "help": SodaAgent._cmd_help,
 }
 
@@ -374,7 +507,9 @@ _HELP = [
     ("/board", "print the board now"),
     ("/watch", "stream the live board for a few seconds"),
     ("/games", "list games"),
-    ("/model", "show models, or switch: /model unified | specialist"),
+    ("/model", "show models, or switch: expert | specialist | unified | instruct"),
+    ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
+    ("/stats", "generation speed: tok/s, ms/reply, frequency"),
     ("/help", "this list"),
     ("/exit", "leave"),
 ]
@@ -427,10 +562,19 @@ def main() -> None:
             continue
         if not text.strip():
             continue
-        console.print(f"[bold magenta]bot ›[/] {escape(agent.handle(text))}")
+        is_command = text.strip().startswith("/")
+        t0 = time.perf_counter()
+        out = agent.handle(text)
+        dt = time.perf_counter() - t0
+        console.print(f"[bold magenta]bot ›[/] {escape(out)}")
         cg = agent.continuous
         if cg is not None and agent.continuous is cg:  # one-line pulse of the game
             console.print(f"[dim]  {cg.game_cls.NAME}: {cg.hud()}[/]")
+        if not is_command:  # model reply — show speed
+            agent.record(out, dt)
+            console.print(f"[dim]  {agent.last['tokens']} tok · "
+                          f"{agent.last['ms']:.0f} ms · {agent.last['tok_s']:.0f} tok/s "
+                          f"· {agent.last['hz']:.1f} Hz[/]")
 
     if agent.continuous is not None:
         agent.continuous.stop()
