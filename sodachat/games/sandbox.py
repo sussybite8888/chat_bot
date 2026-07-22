@@ -27,14 +27,14 @@ import numpy as np
 from .core import Game, register
 
 EMPTY, AGENT, TARGET = 0, 1, 2
-_MAX_STEPS = 400
+_MAX_STEPS = 600
 _DELTA = {"up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1), "stay": (0, 0)}
 
 
 @register
 class SandboxGame(Game):
     NAME = "sandbox"
-    SIZE = (10, 10)
+    SIZE = (20, 20)
     ACTIONS = ("up", "down", "left", "right", "stay")
     N_CELLS = 3
     AUX_DIMS = ()

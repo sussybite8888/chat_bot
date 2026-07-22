@@ -217,7 +217,7 @@ def post_train(base=BASE_PATH, out=OUT_PATH, n_instruct=150_000, n_game=160_000,
     import numpy as np
     import torch
 
-    from .blocks import GPTConfig, pad_load, pick_device, tokenizer_from_payload
+    from .blocks import GPTConfig, make_amp, pad_load, pick_device, tokenizer_from_payload
     from .model import MiniGPT
 
     device = device or pick_device()
@@ -251,17 +251,18 @@ def post_train(base=BASE_PATH, out=OUT_PATH, n_instruct=150_000, n_game=160_000,
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01,
                             betas=(0.9, 0.95))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+    amp = make_amp(device)
     model.train()
     started = time.time()
     for step in range(1, steps + 1):
         ix = np.random.randint(0, len(data) - block - 1, size=batch_size)
         xb = torch.from_numpy(np.stack([data[i:i+block] for i in ix]).astype(np.int64)).to(device)
         yb = torch.from_numpy(np.stack([data[i+1:i+block+1] for i in ix]).astype(np.int64)).to(device)
-        _, loss = model(xb, yb)
+        with amp.autocast():
+            _, loss = model(xb, yb)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        amp.backward(loss)
+        amp.step(opt, model)
         sched.step()
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()

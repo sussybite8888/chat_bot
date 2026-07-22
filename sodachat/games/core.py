@@ -112,6 +112,76 @@ class Game:
         return ", ".join(bits) + (" — game over" if self.done else "")
 
 
+# --------------------------------------------------------------- half-block draw
+
+# Upper/lower half-block glyphs. A single character cell can show two vertical
+# "pixels": the upper half is painted in the foreground colour, the lower half
+# in the background colour. Drawing a board this way packs two grid rows into
+# one terminal line, so a 20-row board fits a 24-row terminal — the plain
+# one-glyph-per-cell view is twice as tall and overflows. Only the live
+# human-facing displays use this; the model still reads Game.render()'s
+# full-height text, which must stay unchanged.
+HALF_UPPER, HALF_LOWER = "▀", "▄"  # ▀ ▄
+
+
+def half_block_board(rows: int, cols: int, colour):
+    """Render a rows×cols board into a `rich.text.Text` at half the height.
+
+    `colour(r, c)` returns the rich colour of cell (r, c), or None for an empty
+    cell (drawn blank, so the board keeps its dark backdrop). Rows are taken two
+    at a time: the upper cell becomes the half-block's foreground, the lower its
+    background. Colour alone distinguishes pieces here, since the per-cell shape
+    glyphs (●, ▲, …) collapse to solid half-cells."""
+    from rich.text import Text
+
+    out = Text()
+    for r in range(0, rows, 2):
+        for c in range(cols):
+            top = colour(r, c)
+            bot = colour(r + 1, c) if r + 1 < rows else None
+            if top and bot:
+                out.append(HALF_UPPER, style=f"{top} on {bot}")
+            elif top:
+                out.append(HALF_UPPER, style=top)
+            elif bot:
+                out.append(HALF_LOWER, style=bot)
+            else:
+                out.append(" ")
+        if r + 2 < rows:
+            out.append("\n")
+    return out
+
+
+def half_block_render(game):
+    """Half-block board for a grid `game`, coloured straight from its GLYPHS
+    (empty cell value 0 -> blank). A drop-in, half-height replacement for the
+    live human display; the model keeps reading full-height `game.render()`."""
+    grid, _ = game.observe()
+
+    def colour(r, c):
+        v = int(grid[r][c])
+        return None if v == 0 else game.GLYPHS.get(v, ("?", "white"))[1]
+
+    return half_block_board(game.rows, game.cols, colour)
+
+
+# Wall colour for the play-field frame — bright enough to read as a boundary
+# without competing with the pieces inside it.
+BOUNDARY_STYLE = "grey58"
+
+
+def framed_board(board, cols: int, style: str = BOUNDARY_STYLE):
+    """Wrap a half-block `board` (a `rich.text.Text`, `cols` characters wide) in
+    a tight box that marks the play-field boundary — the walls a piece dies
+    against. Once empty cells draw blank, the field's edges are otherwise
+    invisible; this puts them back and highlights them."""
+    from rich import box
+    from rich.panel import Panel
+
+    return Panel(board, box=box.SQUARE, border_style=style, padding=0,
+                 width=cols + 2, expand=False)
+
+
 # ------------------------------------------------------------------ tokenizers
 
 

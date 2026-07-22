@@ -34,6 +34,7 @@ from .blocks import (
     RMSNorm,
     SwiGLU,
     _rope_cache,
+    make_amp,
     pick_device,
     tokenizer_from_payload,
     warp_logits,
@@ -436,7 +437,7 @@ def _validate(model, data, block, device, lam, iters=40):
 
 
 def train(base=BASE_PATH, out=DEFAULT_PATH, steps=8000, batch_size=24, lr=2e-4,
-          lam=1.0, block_size=384, n_per_game=50_000, n_snake_instruct=100_000,
+          lam=1.0, block_size=640, n_per_game=50_000, n_snake_instruct=100_000,
           n_chat=250_000, n_read=100_000, device=None, seed=1337, log=print) -> Path:
     """Warm-start ExpertGPT from the dense unified model and train with two
     objectives: LM loss on every token (routed to its task's expert) and action
@@ -444,9 +445,9 @@ def train(base=BASE_PATH, out=DEFAULT_PATH, steps=8000, batch_size=24, lr=2e-4,
     the text expert, game tokens through the game expert — so teaching it to
     play no longer dislodges its chat ability.
 
-    block_size is raised from unified's 256 (RoPE has no learned position params,
-    so warm-start is unaffected) because pong/dodge boards exceed 256 tokens and
-    were being truncated before."""
+    block_size is raised well above unified's window (RoPE has no learned position
+    params, so warm-start is unaffected) because the 20x20 boards render to
+    hundreds of tokens and would otherwise be truncated mid-board."""
     device = device or pick_device()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -479,14 +480,15 @@ def train(base=BASE_PATH, out=DEFAULT_PATH, steps=8000, batch_size=24, lr=2e-4,
          torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(steps - warmup, 1), eta_min=lr * 0.1)],
         milestones=[max(warmup, 1)])
 
+    amp = make_amp(device)
     model.train()
     started, best = time.time(), float("inf")
     for step in range(1, steps + 1):
-        loss, lm_l, act_l, acc = _losses(model, _batch(train_data, block, batch_size, device), lam)
+        with amp.autocast():
+            loss, lm_l, act_l, acc = _losses(model, _batch(train_data, block, batch_size, device), lam)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        amp.backward(loss)
+        amp.step(opt, model)
         sched.step()
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()

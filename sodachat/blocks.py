@@ -35,6 +35,71 @@ def pick_device() -> str:
     return "cpu"
 
 
+class _Amp:
+    """Mixed-precision training context. Use via `make_amp(device)`:
+
+        amp = make_amp(device)
+        with amp.autocast():
+            loss = ...                 # forward + loss in bf16/fp16
+        opt.zero_grad(set_to_none=True)
+        amp.backward(loss)             # replaces loss.backward()
+        amp.step(opt, model)           # unscale + clip_grad_norm_ + opt.step()
+
+    It engages only on CUDA (bf16 on Ampere+, else fp16 with a GradScaler); on
+    CPU/MPS it is a transparent no-op that preserves the exact fp32 path, so
+    behaviour there is unchanged."""
+
+    def __init__(self, device: str, enabled: bool, dtype):
+        self.device = device
+        self.enabled = enabled
+        self.dtype = dtype
+        # A loss scaler is only needed for fp16 on CUDA; bf16 and the fp32
+        # fallback run without one (None => plain backward/step below).
+        self.scaler = None
+        if enabled and device == "cuda" and dtype == torch.float16:
+            try:  # prefer the non-deprecated torch.amp API when present
+                self.scaler = torch.amp.GradScaler("cuda")
+            except (AttributeError, TypeError):
+                self.scaler = torch.cuda.amp.GradScaler()
+
+    def autocast(self):
+        return torch.autocast(self.device, dtype=self.dtype, enabled=self.enabled)
+
+    def backward(self, loss):
+        (self.scaler.scale(loss) if self.scaler else loss).backward()
+
+    def step(self, optimizer, model=None, grad_clip: float = 1.0):
+        if self.scaler is not None:
+            self.scaler.unscale_(optimizer)
+        if grad_clip and model is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if self.scaler is not None:
+            self.scaler.step(optimizer)
+            self.scaler.update()
+        else:
+            optimizer.step()
+
+    @property
+    def tag(self) -> str:
+        return f"{str(self.dtype).rsplit('.', 1)[-1]} AMP" if self.enabled else "fp32"
+
+
+def make_amp(device: str, enabled: bool | None = None) -> _Amp:
+    """Build the mixed-precision helper for a training loop (see `_Amp`).
+
+    Auto-enables on CUDA only, choosing bf16 where the GPU supports it (no loss
+    scaling needed) and fp16 otherwise. `SODACHAT_NO_AMP=1` forces full precision;
+    pass `enabled=` to override explicitly."""
+    import os
+
+    if enabled is None:
+        enabled = device == "cuda" and os.environ.get("SODACHAT_NO_AMP") != "1"
+    dtype = torch.float16
+    if enabled and device == "cuda" and torch.cuda.is_bf16_supported():
+        dtype = torch.bfloat16
+    return _Amp(device, bool(enabled), dtype)
+
+
 def warp_logits(
     logits: torch.Tensor,
     seq: torch.Tensor | None,

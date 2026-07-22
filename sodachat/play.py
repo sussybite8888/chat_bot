@@ -30,21 +30,19 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .games import GAMES, GamePlayer, benchmark_latency, load_model
+from .games import (
+    GAMES, GamePlayer, benchmark_latency, framed_board, half_block_render, load_model,
+)
 from .game_train import game_model_path
 
 _MS_BUDGETS = {"30 fps": 33.33, "60 fps": 16.67, "120 fps": 8.33}
 
 
 def _render(game, player, game_num, n_games, p99_ms) -> Panel:
-    grid, _ = game.observe()
-    body = Text()
-    for r, row in enumerate(grid):
-        for v in row:
-            glyph, style = game.GLYPHS.get(int(v), ("?", "white"))
-            body.append(glyph + " ", style=style)
-        if r < len(grid) - 1:
-            body.append("\n")
+    # Half-block board: two grid rows per line, so a 20-row board fits a normal
+    # terminal instead of spilling past the bottom. Framed so the play-field
+    # walls are visible even when the board is mostly empty.
+    body = framed_board(half_block_render(game), game.cols)
 
     hud = Table.grid(padding=(0, 2))
     hud.add_column(justify="left")
@@ -61,7 +59,7 @@ def _render(game, player, game_num, n_games, p99_ms) -> Panel:
         Group(Align.center(body), Text(""), hud),
         title="sodachat plays",
         border_style="cyan",
-        width=max(2 * game.cols + 4, 34),
+        width=max(game.cols + 4, 34),
     )
 
 

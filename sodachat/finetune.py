@@ -30,6 +30,7 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.5")
 
 import torch
 
+from .blocks import make_amp
 from .data import dailydialog_texts, nps_texts
 from .hf_model import DEFAULT_HF_MODEL_DIR
 from .model import pick_device
@@ -112,6 +113,7 @@ def finetune(
         model.config.use_cache = False
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    amp = make_amp(device)
 
     best_val = float("inf")
     started = time.time()
@@ -122,13 +124,13 @@ def finetune(
         optimizer.zero_grad(set_to_none=True)
         for i in range(0, len(train_blocks) - batch_size + 1, batch_size):
             x = torch.tensor(train_blocks[i : i + batch_size], device=device)
-            loss = model(input_ids=x, labels=x).loss
-            (loss / grad_accum).backward()
+            with amp.autocast():
+                loss = model(input_ids=x, labels=x).loss
+            amp.backward(loss / grad_accum)
             total += loss.item()
             batches += 1
             if batches % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                amp.step(optimizer, model)
                 optimizer.zero_grad(set_to_none=True)
             if device == "mps" and batches % 100 == 0:
                 torch.mps.empty_cache()

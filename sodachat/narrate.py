@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import GPTConfig, pick_device
+from .blocks import GPTConfig, make_amp, pick_device
 from .games.snake import BODY, EMPTY, FOOD, HEAD, SnakeGame
 from .model import MiniGPT
 
@@ -213,6 +213,7 @@ def train(path: Path = DEFAULT_PATH, n_frames=80000, steps=3500,
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+    amp = make_amp(device)
 
     model.train()
     started = time.time()
@@ -223,18 +224,18 @@ def train(path: Path = DEFAULT_PATH, n_frames=80000, steps=3500,
         pb = torch.from_numpy(P[idx]).to(device)
         yb = torch.from_numpy(Y[idx]).to(device)
 
-        lm_logits, act_logits = model.forward_both(xb)
-        lm_loss = F.cross_entropy(
-            lm_logits.view(-1, lm_logits.size(-1)), yb.view(-1), ignore_index=-100
-        )
-        act_at_sep = act_logits[torch.arange(batch_size, device=device), pb]
-        act_loss = F.cross_entropy(act_at_sep, ab)
-        loss = act_loss + lm_loss
+        with amp.autocast():
+            lm_logits, act_logits = model.forward_both(xb)
+            lm_loss = F.cross_entropy(
+                lm_logits.view(-1, lm_logits.size(-1)), yb.view(-1), ignore_index=-100
+            )
+            act_at_sep = act_logits[torch.arange(batch_size, device=device), pb]
+            act_loss = F.cross_entropy(act_at_sep, ab)
+            loss = act_loss + lm_loss
 
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        amp.backward(loss)
+        amp.step(opt, model)
         sched.step()
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()
@@ -306,6 +307,7 @@ class NarratingPlayer:
 def play(path: Path = DEFAULT_PATH, fps=6.0, n_games=3, device="cpu", seed=0):
     import gc
 
+    from rich.align import Align
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
@@ -318,18 +320,26 @@ def play(path: Path = DEFAULT_PATH, fps=6.0, n_games=3, device="cpu", seed=0):
     player = NarratingPlayer(path, device)
     period = 1.0 / fps if fps > 0 else 0.0
 
+    from .games.core import framed_board, half_block_board
+
+    colours = {BODY: "green", HEAD: "bright_green", FOOD: "red"}  # EMPTY: blank
+
     def render(game, action, words):
         grid, _ = game.observe()
-        body = Text()
-        styles = {EMPTY: "grey30", BODY: "green", HEAD: "bright_green", FOOD: "red"}
-        for r, row in enumerate(grid):
-            for v in row:
-                body.append(_GLYPH[int(v)] + " ", style=styles[int(v)])
-            body.append("\n" if r < len(grid) - 1 else "")
+        # Half-block board: two grid rows per line, so it fits a normal terminal.
+        # Framed so the walls are visible around the (mostly empty) field.
+        body = framed_board(
+            half_block_board(
+                game.rows, game.cols,
+                lambda r, c: colours.get(int(grid[r][c])),
+            ),
+            game.cols,
+        )
         bubble = Text(f'\n💬 "{words}"', style="italic cyan")
         hud = Text(f"\nscore {game.score}   move: {action}   "
                    f"[both heads: {player.last_ms:.0f} ms]", style="dim")
-        return Panel(Group(body, bubble, hud), title="sodachat plays & narrates",
+        return Panel(Group(Align.center(body), bubble, hud),
+                     title="sodachat plays & narrates",
                      border_style="cyan", width=40)
 
     best = 0

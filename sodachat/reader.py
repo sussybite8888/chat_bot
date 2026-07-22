@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blocks import GPTConfig, pick_device
+from .blocks import GPTConfig, make_amp, pick_device
 from .model import MiniGPT
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "models" / "reader.pt"
@@ -171,19 +171,20 @@ def train(path: Path = DEFAULT_PATH, n=120000, steps=3000, batch_size=128,
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+    amp = make_amp(device)
     model.train()
     started = time.time()
     for step in range(1, steps + 1):
         idx = np.random.randint(0, len(X), size=batch_size)
         xb = torch.from_numpy(X[idx].astype(np.int64)).to(device)
         yb = torch.from_numpy(Y[idx]).to(device)
-        logits, _ = model(xb)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1),
-                               ignore_index=-100)
+        with amp.autocast():
+            logits, _ = model(xb)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), yb.view(-1),
+                                   ignore_index=-100)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        amp.backward(loss)
+        amp.step(opt, model)
         sched.step()
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()

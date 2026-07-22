@@ -27,11 +27,19 @@ import pygame
 from .game_train import game_model_path
 from .games import GAMES, GamePlayer, load_model
 
-CELL = 40          # pixel size of one grid cell
+# Pixel size of one grid cell. Shrunk so even the largest registered board fits
+# a sensible window (a 20x20 board at 40px would be 800px wide); small boards
+# keep the nominal 40px. Cell-drawing offsets below are relative to CELL, so the
+# shapes scale with it.
+_NOMINAL_CELL = 40
+_BOARD_TARGET_PX = 560
+_grid_sizes = [c.SIZE for c in GAMES.values() if getattr(c, "MODALITY", "grid") == "grid"]
+_max_cells = max((max(s) for s in _grid_sizes), default=12)
+CELL = max(20, min(_NOMINAL_CELL, _BOARD_TARGET_PX // _max_cells))
 TTT_CELL = 116
 TABS_H = 54
 HUD_H = 104
-W = 600
+W = 600            # minimum window width (grown to fit wider boards, see App.w)
 
 BG = (15, 17, 21)
 PANEL = (22, 26, 33)
@@ -80,7 +88,12 @@ class App:
 
         board_h = max(GAMES[n].SIZE[0] * CELL if GAMES[n].MODALITY == "grid"
                       else 3 * TTT_CELL for n in self.names)
+        board_w = max(GAMES[n].SIZE[1] * CELL if GAMES[n].MODALITY == "grid"
+                      else 3 * TTT_CELL for n in self.names)
         self.h = TABS_H + board_h + 40 + HUD_H
+        # Grow the window to fit the widest board (W is just a floor), so a board
+        # is never drawn off-screen. Height already scales with board_h.
+        self.w = max(board_w + 40, W)
         self.tab_rects: list[pygame.Rect] = []
 
     # ------------------------------------------------------------- models
@@ -99,6 +112,17 @@ class App:
     def _load(self, name: str) -> None:
         try:
             model, tok, _ = load_model(game_model_path(name), self.device)
+            # A checkpoint bakes in the board size it was trained on; if the game
+            # has since been resized, its fixed input buffer can't hold the board
+            # and GamePlayer.act would crash the loop. Show the fix instead.
+            trained = tuple(getattr(tok, "size", ()) or ())
+            want = tuple(GAMES[name].SIZE)
+            if GAMES[name].MODALITY == "grid" and trained and trained != want:
+                self.errors[name] = (
+                    f"model is for a {trained[0]}x{trained[1]} board,\n"
+                    f"but {name} is now {want[0]}x{want[1]} — retrain it:\n"
+                    f"python -m sodachat.game_train --game {name}")
+                return
             self.players[name] = GamePlayer(model, tok, self.device)
         except Exception as e:  # surface the error in the window, don't die
             self.errors[name] = f"failed to load model:\n{e}"
@@ -214,7 +238,7 @@ class App:
             x = r.right + 8
 
     def _board_origin(self, bw: int, bh: int) -> tuple[int, int]:
-        return (W - bw) // 2, TABS_H + 20
+        return (self.w - bw) // 2, TABS_H + 20
 
     def _draw_grid(self, screen) -> None:
         g = self.game
@@ -287,12 +311,12 @@ class App:
         y = TABS_H + 60
         for line in text.split("\n"):
             label = fonts["hud"].render(line, True, colour)
-            screen.blit(label, ((W - label.get_width()) // 2, y))
+            screen.blit(label, ((self.w - label.get_width()) // 2, y))
             y += 26
 
     def _draw_hud(self, screen, fonts) -> None:
         y0 = self.h - HUD_H
-        pygame.draw.rect(screen, PANEL, (0, y0, W, HUD_H))
+        pygame.draw.rect(screen, PANEL, (0, y0, self.w, HUD_H))
         g = self.game
         if self.is_ttt:
             t = self.tally
@@ -309,7 +333,7 @@ class App:
         screen.blit(fonts["hud"].render(left, True, FG), (16, y0 + 14))
         if right:
             label = fonts["hud"].render(right, True, DIM)
-            screen.blit(label, (W - label.get_width() - 16, y0 + 14))
+            screen.blit(label, (self.w - label.get_width() - 16, y0 + 14))
         if state:
             screen.blit(fonts["hud"].render(state, True, ACCENT), (16, y0 + 42))
         hint = ("click a cell to play X · n new game · 1-4 games · q quit"
@@ -359,7 +383,7 @@ class App:
 
     def run(self, max_seconds: float | None = None) -> None:
         pygame.init()
-        screen = pygame.display.set_mode((W, self.h))
+        screen = pygame.display.set_mode((self.w, self.h))
         pygame.display.set_caption("sodachat plays")
         fonts = {
             "tab": pygame.font.SysFont("menlo, monaco, courier", 18, bold=True),

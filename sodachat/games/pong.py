@@ -8,8 +8,8 @@ import numpy as np
 from .core import Game, register
 
 EMPTY, BALL, PADDLE = 0, 1, 2
-_PAD = 3  # paddle height
-_MAX_STEPS = 400
+_PAD = 4  # paddle height
+_MAX_STEPS = 600
 
 
 def _reflect(x: int, n: int) -> int:
@@ -24,7 +24,7 @@ def _reflect(x: int, n: int) -> int:
 @register
 class PongGame(Game):
     NAME = "pong"
-    SIZE = (12, 12)
+    SIZE = (20, 20)
     ACTIONS = ("up", "down", "stay")
     N_CELLS = 3
     AUX_DIMS = (2, 2)  # sign of vertical, horizontal velocity

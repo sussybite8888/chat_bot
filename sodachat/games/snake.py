@@ -17,7 +17,7 @@ _OPPOSITE = {"up": "down", "down": "up", "left": "right", "right": "left"}
 @register
 class SnakeGame(Game):
     NAME = "snake"
-    SIZE = (10, 10)
+    SIZE = (20, 20)
     ACTIONS = ("up", "down", "left", "right")
     N_CELLS = 4
     AUX_DIMS = (4,)  # heading

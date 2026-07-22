@@ -8,15 +8,16 @@ import numpy as np
 from .core import Game, register
 
 EMPTY, AGENT, WALL = 0, 1, 2
-_GAP = 3      # width of the opening in each wall
-_SPACING = 4  # ticks between wall spawns
-_MAX_STEPS = 500
+_GAP = 4      # width of the opening in each wall
+_SPACING = 7  # ticks between wall spawns (scaled with the wider board so the
+              # gap of the next wall stays reachable in the steps before it lands)
+_MAX_STEPS = 600
 
 
 @register
 class DodgeGame(Game):
     NAME = "dodge"
-    SIZE = (12, 10)
+    SIZE = (20, 16)
     ACTIONS = ("left", "right", "stay")
     N_CELLS = 3
     AUX_DIMS = ()

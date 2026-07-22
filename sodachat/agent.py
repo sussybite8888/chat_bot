@@ -72,6 +72,7 @@ class ContinuousGame:
         self.game = game_cls(seed=0)
         self.games_played = 0
         self.best = 0
+        self.error: Exception | None = None  # set if the play thread dies
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> "ContinuousGame":
@@ -79,21 +80,33 @@ class ContinuousGame:
         return self
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            with self._lock:
-                if self.game.done:
-                    self.best = max(self.best, self.game.score)
-                    self.games_played += 1
-                    self.game = self.game_cls(seed=self.games_played)
-                else:
-                    self.game.step(self.player.act(self.game))
-            time.sleep(self.period)
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    if self.game.done:
+                        self.best = max(self.best, self.game.score)
+                        self.games_played += 1
+                        self.game = self.game_cls(seed=self.games_played)
+                    else:
+                        self.game.step(self.player.act(self.game))
+                time.sleep(self.period)
+        except Exception as e:  # never die silently — record it and stop cleanly
+            self.error = e
+            self._stop.set()
 
     def view(self) -> tuple[str, str, str]:
         """(board, one-line state, score) read atomically."""
         with self._lock:
             return (self.game.render(), self.game.describe(),
                     str(self.game.facts()["score"]))
+
+    def board_text(self):
+        """A compact, coloured half-block board (a `rich.text.Text`) for the live
+        display — half the height of `render()`, so it fits the terminal."""
+        from .games.core import half_block_render
+
+        with self._lock:
+            return half_block_render(self.game)
 
     def facts(self) -> dict:
         with self._lock:
@@ -105,8 +118,9 @@ class ContinuousGame:
 
     def hud(self) -> str:
         with self._lock:
+            note = f"   [stopped: {self.error}]" if self.error else ""
             return (f"score {self.game.score}   best {max(self.best, self.game.score)}"
-                    f"   game #{self.games_played + 1}")
+                    f"   game #{self.games_played + 1}{note}")
 
     def stop(self) -> None:
         self._stop.set()
@@ -176,9 +190,12 @@ class SodaAgent:
         # every mode (not just specialist). Keyed by checkpoint path so the
         # per-engine recent-reply deque persists across mode switches.
         self._engines: dict = {}
-        # Default to the task-routed expert model once it's been trained; it
-        # chats, reads, and plays from one model with separated game/chat weights.
-        self.mode = "expert" if (_MODELS / "expert.pt").exists() else "specialist"
+        # Default to the specialist models: after the boards were enlarged to
+        # 20x20, they are the ones retrained to perceive the new size. The 30M
+        # expert/unified models still read the old board size, so they stay
+        # opt-in (/model expert) until retrained — chat/read are unaffected, but
+        # their game moves would be out-of-distribution on the bigger boards.
+        self.mode = "specialist"
         self.goal = "eat the food"  # instruction used for moves (instruct/expert)
         self.goal_set = False  # True once the user picks a goal with /goal
         self.history: list[str] = []
@@ -296,11 +313,29 @@ class SodaAgent:
         model, tok, _ = load_model(path, self.device)
         return GamePlayer(model, tok, self.device)
 
+    def _size_mismatch(self, name: str, player) -> str | None:
+        """A specialist checkpoint bakes in the board size it was trained on. If
+        the game has since been resized (e.g. the 10x10 -> 20x20 enlargement), a
+        GamePlayer's fixed-size input buffer can't hold the new board and would
+        crash mid-play. Detect that here and explain it instead. The LM movers
+        (expert/unified/instruct) read a text board and aren't size-locked."""
+        if not isinstance(player, GamePlayer):
+            return None
+        trained = tuple(getattr(player.tok, "size", ()) or ())
+        want = tuple(GAMES[name].SIZE)
+        if trained and trained != want:
+            return (f"My {name} model was trained for a {trained[0]}x{trained[1]} "
+                    f"board, but {name} is now {want[0]}x{want[1]}. Retrain it for "
+                    f"the new size:\n  python -m sodachat.game_train --game {name}")
+        return None
+
     def _start_game(self, name: str) -> str:
         player = self._player_for(name)
         if player is None:
             return (f"I haven't learned {name} yet — train it first:\n"
                     f"  python -m sodachat.game_train --game {name}")
+        if (mismatch := self._size_mismatch(name, player)) is not None:
+            return mismatch
         if GAMES[name].MODALITY == "text":  # tic-tac-toe: you play me
             self.player, self.game = player, GAMES[name](seed=0)
             return (f"Tic-tac-toe — you're X, I'm O, you first. Type a cell 0-8 to "
@@ -374,6 +409,13 @@ class SodaAgent:
 
     def _cmd_games(self, arg: str) -> str:
         return "Games: " + ", ".join(GAMES) + "."
+
+    def _cmd_duel(self, arg: str) -> str:
+        # The live duel takes over the terminal, so the terminal loop runs it
+        # (like /watch). Reached here only from non-terminal frontends.
+        return ("Multiplayer snake is live and keyboard-driven — run /duel at the "
+                "terminal prompt (python -m sodachat.agent), or play it standalone "
+                "with python -m sodachat.games.versus.")
 
     # ------------------------------------------------------------- stats
 
@@ -502,6 +544,9 @@ class SodaAgent:
 # name -> handler. The dispatch is a table, not a branch chain.
 _COMMANDS = {
     "play": SodaAgent._cmd_play,
+    "duel": SodaAgent._cmd_duel,
+    "versus": SodaAgent._cmd_duel,
+    "vs": SodaAgent._cmd_duel,
     "stop": SodaAgent._cmd_stop,
     "score": SodaAgent._cmd_score,
     "state": SodaAgent._cmd_state,
@@ -518,6 +563,7 @@ _COMMANDS = {
 # For /help. /watch and /exit are handled by the terminal loop, not the agent.
 _HELP = [
     ("/play <game>", "start a game (snake, pong, dodge, tictactoe)"),
+    ("/duel", "play snake against me — you steer, live (WASD/arrows)"),
     ("/stop", "stop the current game"),
     ("/score", "current score"),
     ("/state", "one-line game state (food, length, whose turn, ...)"),
@@ -538,19 +584,31 @@ _HELP = [
 def _watch(agent: SodaAgent, console) -> None:
     """Stream the live board for a few seconds. Input is paused here, so the
     animation never fights with the prompt. Ctrl-C returns early."""
+    from rich.align import Align
+    from rich.console import Group
     from rich.live import Live
     from rich.panel import Panel
     from rich.text import Text
+
+    from .games.core import framed_board
 
     console.print("[dim](watching — Ctrl-C to stop)[/]")
     try:
         with Live(console=console, refresh_per_second=10, transient=True) as live:
             start = time.perf_counter()
             while agent.continuous is not None and time.perf_counter() - start < 8:
-                board, _, _ = agent.continuous.view()
-                live.update(Panel(Text(board + f"\n\n{agent.continuous.hud()}",
-                                       style="green"),
-                                  title="playing live", border_style="cyan", width=40))
+                # Half-block board: two grid rows per line, so even the tallest
+                # board fits the terminal as it animates in place. Framed so the
+                # play-field walls are visible around the empty cells.
+                board = agent.continuous.board_text()
+                # size the panel to the board so bigger resolutions aren't clipped
+                cols = max((len(l) for l in board.plain.splitlines()), default=20)
+                hud = Text(agent.continuous.hud(), style="dim")
+                width = max(cols + 4, 34)
+                live.update(Panel(Group(Align.center(framed_board(board, cols)),
+                                        Text(""), hud),
+                                  title="playing live", border_style="cyan",
+                                  width=width))
                 time.sleep(0.1)
     except KeyboardInterrupt:
         pass
@@ -573,6 +631,11 @@ def main() -> None:
         low = text.strip().lower()
         if low in {"/exit", "/quit"}:
             break
+        if low in {"/duel", "/versus", "/vs"}:  # live, keyboard-driven; takes the screen
+            from .games.versus import play_duel
+
+            play_duel(agent=agent, device=agent.device, console=console)
+            continue
         if low == "/watch":
             _watch(agent, console) if agent.continuous else console.print(
                 "[bold magenta]bot ›[/] No game running.")

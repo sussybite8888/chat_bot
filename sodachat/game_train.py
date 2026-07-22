@@ -6,7 +6,7 @@ Each training example is a serialized board (see games/core.py); the model
 predicts the single action token that follows. This is supervised action
 prediction — we read the logits at the final position and cross-entropy them
 against the expert's move — so no capacity is wasted reconstructing the board.
-The model is ~1M params and trains in a few minutes on any device.
+The model is ~1.8M params (on the 20x20 boards) and trains in a few minutes on a GPU.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from .games import GAMES, GamePlayer, evaluate_headless, generate_dataset
-from .blocks import GPTConfig, pick_device
+from .blocks import GPTConfig, make_amp, pick_device
 from .model import MiniGPT, save_checkpoint
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -80,12 +80,17 @@ def train_game_model(
     X, y = X[perm], y[perm]
     Xtr, ytr, Xval, yval = X[:-n_val], y[:-n_val], X[-n_val:], y[-n_val:]
 
+    # block_size == the board's token length, so the model's "perceptual field"
+    # scales automatically with SIZE (a 20x20 grid is ~420 tokens vs ~112 at
+    # 10x10). More attention heads give it finer resolution over that larger
+    # view; the trunk is widened modestly (128 -> 192) for the extra capacity
+    # without blowing up the O(block^2) attention cost on the bigger board.
     cfg = GPTConfig(
         vocab_size=len(tok),
         block_size=tok.state_len,
         n_layer=4,
-        n_head=4,
-        n_embd=128,
+        n_head=8,
+        n_embd=192,
         dropout=0.0,
     )
     model = MiniGPT(cfg).to(device)
@@ -94,6 +99,7 @@ def train_game_model(
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+    amp = make_amp(device)
 
     model.train()
     started = time.time()
@@ -102,11 +108,11 @@ def train_game_model(
         idx = np.random.randint(0, len(Xtr), size=batch_size)
         xb = torch.from_numpy(Xtr[idx].astype(np.int64)).to(device)
         target = torch.from_numpy(ytr[idx].astype(np.int64)).to(device)
-        loss = F.cross_entropy(model(xb)[0][:, -1, :], target)
+        with amp.autocast():
+            loss = F.cross_entropy(model(xb)[0][:, -1, :], target)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        amp.backward(loss)
+        amp.step(opt, model)
         sched.step()
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()

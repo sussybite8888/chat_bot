@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blocks import BPETokenizer, GPTConfig, pick_device
+from .blocks import BPETokenizer, GPTConfig, make_amp, pick_device
 from .model import (
     _CHAT_REPETITION_PENALTY,
     _CHAT_TOP_P,
@@ -48,8 +48,10 @@ DEFAULT_PATH = MODELS_DIR / "unified.pt"
 CHAT, READ, GAME, END = "<|chat|>", "<|read|>", "<|game|>", "<|end|>"
 _SPECIALS = [CHAT, READ, GAME, END]
 
-# ~30M params: bigger than the 14M chat model (6L/384d).
-PRESET = dict(vocab_size=10000, block_size=256, n_layer=8, n_head=8, n_embd=512)
+# ~30M params: bigger than the 14M chat model (6L/384d). block_size holds a
+# whole game board in context: a 20x20 render is well over 256 tokens, so the
+# window is 512 to perceive the larger boards without truncation.
+PRESET = dict(vocab_size=10000, block_size=512, n_layer=8, n_head=8, n_embd=512)
 
 # How many task docs to mint. Chat (SODA) dominates; oversample the smaller
 # tasks so the model actually learns them.
@@ -201,15 +203,16 @@ def train(out=DEFAULT_PATH, steps=24000, batch_size=24, lr=3e-4, device=None,
          torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(steps - warmup, 1), eta_min=lr * 0.1)],
         milestones=[max(warmup, 1)])
 
+    amp = make_amp(device)
     model.train()
     started, best = time.time(), float("inf")
     for step in range(1, steps + 1):
         x, y = _batch(train_data, cfg.block_size, batch_size, device)
-        _, loss = model(x, y)
+        with amp.autocast():
+            _, loss = model(x, y)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        amp.backward(loss)
+        amp.step(opt, model)
         sched.step()
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()
@@ -300,7 +303,10 @@ class UnifiedLM:
     def move(self, game_name: str, board: str, legal: list[str]) -> str:
         prompt = f"{GAME} {game_name}\n{board}\nmove:"
         out = self._gen(prompt, 4, 0.4, [self._nl, self._end]).strip()
-        return next((a for a in legal if out.startswith(a)), out.split()[0] if out else legal[0])
+        # Fall back to a *legal* action, never the raw model output: an older
+        # multi-game model on an out-of-distribution board can emit another
+        # game's action (e.g. "stay" for snake), which would crash game.step.
+        return next((a for a in legal if out.startswith(a)), legal[0] if legal else out)
 
     def instruct_move(self, game_name: str, board: str, instruction: str,
                       legal: list[str]) -> str:
@@ -308,7 +314,8 @@ class UnifiedLM:
         whose tokenizer has <|act|> — i.e. the instruction post-trained model."""
         prompt = f"<|act|> {game_name} | goal: {instruction}\n{board}\nmove:"
         out = self._gen(prompt, 4, 0.3, [self._nl, self._end]).strip()
-        return next((a for a in legal if out.startswith(a)), out.split()[0] if out else legal[0])
+        # legal fallback only — never the raw output (see move() for why).
+        return next((a for a in legal if out.startswith(a)), legal[0] if legal else out)
 
 
 def main() -> None:

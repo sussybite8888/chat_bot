@@ -200,12 +200,12 @@ curl -s -X POST localhost:8080/ -H 'Content-Type: application/json' \
 
 ## Playing games
 
-The same architecture, small enough to decide in ~1.6ms, also works as a game
-controller. `sodachat/games/` is a general framework: a game exposes an
+The same architecture, small enough to decide a move in real time, also works as
+a game controller. `sodachat/games/` is a general framework: a game exposes an
 observation and the model predicts an action token, trained by **behaviour
 cloning** (a scripted expert plays thousands of games; the model learns to
-predict its move). No reinforcement learning, no pretrained weights — ~1M
-parameters, trained in minutes.
+predict its move). No reinforcement learning, no pretrained weights — ~1.8M
+parameters reading a 20×20 board, trained in minutes on a GPU.
 
 Crucially, observations don't have to be bitmaps. Two modalities are built in:
 
@@ -228,15 +228,28 @@ agent both converses *and* plays (see below).
 .venv/bin/python -m sodachat.game_train --game snake      # train (snake/pong/dodge/tictactoe)
 .venv/bin/python -m sodachat.play       --game snake      # watch a grid game, live
 .venv/bin/python -m sodachat.gui                          # same, in a desktop window
+.venv/bin/python -m sodachat.games.versus                 # play snake against the bot (multiplayer)
 ```
 
-`play` shows a HUD with the score and the model's decide time — typically
-~1.6ms/move, hundreds of moves per second, far faster than the frame rate.
-Add `--fps 0` to let it run flat out.
+`play` shows a HUD with the score and the model's decide time — on the 20×20
+boards, roughly ~16ms/move on a laptop CPU (tens of moves per second), still far
+faster than the frame rate. Add `--fps 0` to let it run flat out.
 
 `gui` opens a pygame window with tabs for all four games: grid games play
 themselves continuously (space pauses, `+`/`-` changes speed), and tic-tac-toe
 is interactive — click a cell to play X against the model.
+
+**Multiplayer snake — you vs. the bot.** `games.versus` (or `/duel` in the
+agent) puts two snakes on one board, both racing for the same food: you steer
+one with WASD / the arrow keys, the bot steers the other in real time. The bot
+needs *no new model* — each tick the two-snake board is folded into the ordinary
+*single-snake* view the solo model already reads, with your snake drawn as plain
+body cells, i.e. one more wall to avoid. Since a second snake is out of the solo
+model's training distribution, the same masking idea that keeps it from playing
+an *illegal* move is extended to keep it from playing a *suicidal* one: it
+follows the model's move unless that move would crash this tick, then steps clear
+via the scripted greedy. Run into a wall, yourself, or either body and you're
+out; head-on, the longer snake lives; last snake standing wins.
 
 ### One agent: chat and play together
 
@@ -266,10 +279,10 @@ bot › Stopped — best score was 5.
 ```
 
 The interface has one rule: **plain text goes to the model**, and **game
-control is `/commands`** — `/play`, `/stop`, `/watch`, the exact, deterministic
-readouts `/score`, `/state`, `/board`, `/model`, and `/stats` (generation speed:
-tok/s, ms/reply, frequency). `/help` lists them. Each reply also shows its
-speed inline.
+control is `/commands`** — `/play`, `/stop`, `/watch`, `/duel` (play snake
+against the bot, live), the exact, deterministic readouts `/score`, `/state`,
+`/board`, `/model`, and `/stats` (generation speed: tok/s, ms/reply, frequency).
+`/help` lists them. Each reply also shows its speed inline.
 
 `/model` shows the loaded models (params, architecture, training) and **switches
 which model powers the agent**, live:
@@ -345,7 +358,7 @@ action head picks the move while the LM head narrates it:
 · · · · · · · · · ·        score 3   move: up
 ```
 
-The move is ready from that first forward pass (~1.6 ms); the words are then
+The move is ready from that first forward pass; the words are then
 generated token by token from the LM head (~20–70 ms), so the action never
 waits on the narration. The action head plays a real game (Snake avg ~22,
 versus ~26 for the single-purpose model — a small cost for the shared trunk
@@ -489,4 +502,5 @@ sodachat/
   play.py         # real-time terminal UI for grid games (rich.Live)
   games/          # pluggable games: core framework + snake/pong/dodge/tictactoe
                   #   + sandbox (a no-train VLA test grid)
+                  #   + versus (multiplayer snake: you vs. the bot, reusing the solo model)
 ```

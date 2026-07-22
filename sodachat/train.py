@@ -38,7 +38,7 @@ from .data import (
     nps_dialogues,
     soda_dialogues,
 )
-from .blocks import BPETokenizer, CharTokenizer, GPTConfig, pick_device
+from .blocks import BPETokenizer, CharTokenizer, GPTConfig, make_amp, pick_device
 from .model import MiniGPT, default_model_path, save_checkpoint
 
 # Model size and schedule per dataset. Dropout only earns its keep when the
@@ -257,16 +257,17 @@ def train_model(
     )
 
     eval_every = max(250, steps // 40)
+    amp = make_amp(device)
     model.train()
     started = time.time()
     best_val = float("inf")
     for step in range(1, steps + 1):
         x, y = _batch(train_data, cfg.block_size, batch_size, device)
-        _, loss = model(x, y)
+        with amp.autocast():
+            _, loss = model(x, y)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        amp.backward(loss)
+        amp.step(optimizer, model)
         sched.step()
 
         if device == "mps" and step % 100 == 0:
