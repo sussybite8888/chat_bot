@@ -68,6 +68,12 @@ The engine ([engine.py](sodachat/engine.py)) wraps that with:
 
 - **Conversation history** — the last few turns condition each generation
   (kept per terminal session / Discord channel / Google Chat space).
+- **Nucleus sampling + repetition penalty** — reply candidates are sampled with
+  top-p (`0.95`) instead of a bare top-k, a softer tail cut, plus a mild CTRL-
+  style repetition penalty (`1.15`) over the tokens generated so far, which keeps
+  the model off the self-looping continuations small LMs fall into. The same
+  knobs the GPT-2 backend already uses; applied only to chat, not the low-
+  temperature reader/game paths. See `warp_logits` in [blocks.py](sodachat/blocks.py).
 - **Relevance reranking (MMI)** — several candidate replies are sampled and
   each is scored by how much the conversation context raises its likelihood
   versus no context (`log P(reply | context) − λ·log P(reply)`, computed
@@ -221,11 +227,16 @@ agent both converses *and* plays (see below).
 ```sh
 .venv/bin/python -m sodachat.game_train --game snake      # train (snake/pong/dodge/tictactoe)
 .venv/bin/python -m sodachat.play       --game snake      # watch a grid game, live
+.venv/bin/python -m sodachat.gui                          # same, in a desktop window
 ```
 
 `play` shows a HUD with the score and the model's decide time — typically
 ~1.6ms/move, hundreds of moves per second, far faster than the frame rate.
 Add `--fps 0` to let it run flat out.
+
+`gui` opens a pygame window with tabs for all four games: grid games play
+themselves continuously (space pauses, `+`/`-` changes speed), and tic-tac-toe
+is interactive — click a cell to play X against the model.
 
 ### One agent: chat and play together
 

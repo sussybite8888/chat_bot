@@ -32,9 +32,15 @@ os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.5")
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .blocks import BPETokenizer, GPTConfig, pick_device
-from .model import MiniGPT, save_checkpoint
+from .model import (
+    _CHAT_REPETITION_PENALTY,
+    _CHAT_TOP_P,
+    MiniGPT,
+    save_checkpoint,
+)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 DEFAULT_PATH = MODELS_DIR / "unified.pt"
@@ -237,12 +243,14 @@ class UnifiedLM:
         self._nl = self.tok.encode("\n")[0]
         self._end = self.tok.token_id(END)
 
-    def _gen(self, prompt, max_new, temperature, stop):
+    def _gen(self, prompt, max_new, temperature, stop, top_p=None,
+             repetition_penalty=1.0):
         ids = self.tok.encode(prompt)
         idx = torch.tensor([ids[-self.model.cfg.block_size:]], dtype=torch.long,
                            device=self.device)
         out = self.model.generate(idx, max_new_tokens=max_new, temperature=temperature,
-                                  top_k=40, stop_tokens=stop)
+                                  top_k=40, top_p=top_p,
+                                  repetition_penalty=repetition_penalty, stop_tokens=stop)
         return self.tok.decode(out[0][idx.shape[1]:].tolist())
 
     def chat(self, history: list[str], message: str, temperature=0.8) -> str:
@@ -250,7 +258,38 @@ class UnifiedLM:
         lines = [f"{'AB'[(len(turns) - 1 - i) % 2]}: {t}"
                  for i, t in enumerate(turns)]
         prompt = f"{CHAT}\n" + "\n".join(lines) + "\nB:"
-        return self._gen(prompt, 48, temperature, [self._nl, self._end]).strip()
+        return self._gen(prompt, 48, temperature, [self._nl, self._end],
+                         top_p=_CHAT_TOP_P,
+                         repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
+
+    # The ChatEngine protocol (generate_line + logprob), so this model can be
+    # wrapped by ChatEngine and get the same MMI relevance reranking the mini
+    # model does. `prompt` is a tag-less "A:…\nB:" frame (from build_prompt); we
+    # re-tag it with CHAT to match the training format. (instruct-mode loads a
+    # unified-instruct checkpoint as a UnifiedLM, so this covers that mode too.)
+    def generate_line(self, prompt: str, temperature: float = 0.8) -> str:
+        return self._gen(f"{CHAT}\n" + prompt, 48, temperature,
+                         [self._nl, self._end], top_p=_CHAT_TOP_P,
+                         repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
+
+    @torch.no_grad()
+    def logprob(self, context: str, continuation: str) -> float:
+        """Mean per-token log-prob of `continuation` as a bot chat line, given
+        `context` — for MMI reranking."""
+        ctx = self.tok.encode(f"{CHAT}\n" + context) or [self._nl]
+        cont = self.tok.encode(" " + continuation.strip() + "\n")
+        if not cont:
+            return float("-inf")
+        block = self.model.cfg.block_size
+        overflow = len(ctx) + len(cont) - block
+        if overflow > 0:  # trim old context, never the continuation
+            ctx = ctx[overflow:] or [self._nl]
+        ids = torch.tensor([ctx + cont], dtype=torch.long, device=self.device)
+        logits, _ = self.model(ids[:, :-1])
+        logprobs = F.log_softmax(logits[0], dim=-1)
+        targets = ids[0, len(ctx):]
+        picked = logprobs[len(ctx) - 1:].gather(1, targets.unsqueeze(1))
+        return float(picked.mean())
 
     def read(self, fields: dict, question: str) -> str:
         from .reader import state_block

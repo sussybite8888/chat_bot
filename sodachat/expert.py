@@ -36,7 +36,9 @@ from .blocks import (
     _rope_cache,
     pick_device,
     tokenizer_from_payload,
+    warp_logits,
 )
+from .model import _CHAT_REPETITION_PENALTY, _CHAT_TOP_P
 
 TEXT, GAME = 0, 1
 N_EXPERTS = 2
@@ -153,17 +155,22 @@ class ExpertGPT(nn.Module):
 
     @torch.no_grad()
     def generate_text(self, idx, task_id, max_new_tokens, temperature=0.8,
-                      top_k=40, stop_tokens=()):
+                      top_k=40, top_p=None, repetition_penalty=1.0, stop_tokens=()):
         """Autoregressive text from the LM head, every token routed to `task_id`'s
         expert (TEXT for chat/read). Games don't use this — see `move_logits`."""
         stop = set(stop_tokens)
+        start = idx.shape[1]
         for _ in range(max_new_tokens):
             cond = idx[:, -self.cfg.block_size:]
             task = torch.full_like(cond, task_id)
-            logits = self(cond, task)[0][:, -1, :] / max(temperature, 1e-5)
-            if top_k:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("inf")
+            logits = warp_logits(
+                self(cond, task)[0][:, -1, :],
+                idx[:, start:],  # penalize only what this call generated
+                temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, 1)
             idx = torch.cat([idx, nxt], dim=1)
@@ -547,17 +554,50 @@ class ExpertLM:
         ids = self.tok.encode(prompt)[-self.block:]
         return torch.tensor([ids], dtype=torch.long, device=self.device)
 
-    def _gen(self, prompt, task_id, max_new, temperature):
+    def _gen(self, prompt, task_id, max_new, temperature, top_p=None,
+             repetition_penalty=1.0):
         idx = self._ids(prompt)
         out = self.model.generate_text(idx, task_id, max_new, temperature,
-                                       top_k=40, stop_tokens=[self._nl, self._end])
+                                       top_k=40, top_p=top_p,
+                                       repetition_penalty=repetition_penalty,
+                                       stop_tokens=[self._nl, self._end])
         return self.tok.decode(out[0][idx.shape[1]:].tolist())
 
     def chat(self, history: list[str], message: str, temperature=0.8) -> str:
         turns = [*history, message]
         lines = [f"{'AB'[(len(turns) - 1 - i) % 2]}: {t}" for i, t in enumerate(turns)]
         prompt = f"{CHAT}\n" + "\n".join(lines) + "\nB:"
-        return self._gen(prompt, TEXT, 48, temperature).strip()
+        return self._gen(prompt, TEXT, 48, temperature, top_p=_CHAT_TOP_P,
+                         repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
+
+    # The ChatEngine protocol (generate_line + logprob), so the expert model can
+    # be wrapped by ChatEngine and get the same MMI relevance reranking the mini
+    # model does. `prompt` is a tag-less "A:…\nB:" chat frame (from build_prompt);
+    # we re-tag it and route to the TEXT expert to match training data exactly.
+    def generate_line(self, prompt: str, temperature: float = 0.8) -> str:
+        return self._gen(f"{CHAT}\n" + prompt, TEXT, 48, temperature,
+                         top_p=_CHAT_TOP_P,
+                         repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
+
+    @torch.no_grad()
+    def logprob(self, context: str, continuation: str) -> float:
+        """Mean per-token log-prob of `continuation` as a bot chat line, given
+        `context` — for MMI reranking. Routed to the TEXT expert."""
+        ctx = self.tok.encode(f"{CHAT}\n" + context) or [self._nl]
+        cont = self.tok.encode(" " + continuation.strip() + "\n")
+        if not cont:
+            return float("-inf")
+        overflow = len(ctx) + len(cont) - self.block
+        if overflow > 0:  # trim old context, never the continuation
+            ctx = ctx[overflow:] or [self._nl]
+        ids = torch.tensor([ctx + cont], dtype=torch.long, device=self.device)
+        inp = ids[:, :-1]  # predict each continuation token from its predecessor
+        task = torch.full_like(inp, TEXT)  # whole doc is a chat doc
+        logits = self.model(inp, task)[0]  # lm_head logits only
+        logprobs = F.log_softmax(logits[0], dim=-1)
+        targets = ids[0, len(ctx):]
+        picked = logprobs[len(ctx) - 1:].gather(1, targets.unsqueeze(1))
+        return float(picked.mean())
 
     def read(self, fields: dict, question: str) -> str:
         from .reader import state_block

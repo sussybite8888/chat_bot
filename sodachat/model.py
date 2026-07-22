@@ -42,6 +42,7 @@ from .blocks import (  # noqa: F401
     pad_load,
     pick_device,
     tokenizer_from_payload,
+    warp_logits,
 )
 
 # The chat protocol shared by training data (data.py) and inference. Turns are
@@ -155,17 +156,24 @@ class MiniGPT(nn.Module):
         max_new_tokens: int,
         temperature: float = 0.8,
         top_k: int | None = 40,
+        top_p: float | None = None,
+        repetition_penalty: float = 1.0,
         stop_tokens: list[int] | None = None,
     ) -> torch.Tensor:
         self.eval()
         stop = set(stop_tokens or ())
+        start = idx.shape[1]
         for _ in range(max_new_tokens):
             ctx = idx[:, -self.cfg.block_size :]
             logits, _ = self(ctx)
-            logits = logits[:, -1, :] / max(temperature, 1e-5)
-            if top_k:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("inf")
+            logits = warp_logits(
+                logits[:, -1, :],
+                idx[:, start:],  # penalize only what this call generated
+                temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
             next_id = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
             if next_id.item() in stop:
                 break
@@ -214,6 +222,15 @@ def load_checkpoint(
 # --------------------------------------------------------- the chat model
 
 
+# Chat-reply sampling. A nucleus cut plus a mild repetition penalty steer the
+# from-scratch model off the generic, self-looping continuations a bare top-k
+# leaves in; the same knobs the GPT-2 backend already uses (hf_model.py). Kept
+# off the reader/game paths, which want exact, low-temperature reads.
+_CHAT_TOP_K = 40
+_CHAT_TOP_P = 0.95
+_CHAT_REPETITION_PENALTY = 1.15
+
+
 class MiniChatLM:
     """Inference wrapper around the from-scratch GPT."""
 
@@ -241,7 +258,9 @@ class MiniChatLM:
             idx,
             max_new_tokens=self._max_new,
             temperature=temperature,
-            top_k=40,
+            top_k=_CHAT_TOP_K,
+            top_p=_CHAT_TOP_P,
+            repetition_penalty=_CHAT_REPETITION_PENALTY,
             stop_tokens=self._stop_ids,
         )
         return self.tokenizer.decode(out[0][len(ids) :].tolist()).strip()

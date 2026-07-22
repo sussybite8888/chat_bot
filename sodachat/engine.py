@@ -130,15 +130,27 @@ class ChatEngine:
         seed: int | None = None,
         backend: str | None = None,
         model_path: Path | None = None,
+        lm=None,
     ):
+        """`lm` injects a pre-built inference model (anything exposing
+        `generate_line(prompt, temperature)` and `logprob(context, continuation)`)
+        — e.g. an ExpertLM or UnifiedLM. When given, `backend`/`model_path` are
+        ignored and the MMI reranking in reply() runs over that model, so the
+        same relevance filtering applies to every mode, not just the mini/specialist
+        path. Frontends keep using backend=/model_path= as before."""
         self._filtered = filtered
         self._rng = random.Random(seed)
         if seed is not None:
             torch.manual_seed(seed)
         self._recent: deque[str] = deque(maxlen=8)
 
-        self.backend = (backend or os.environ.get("SODACHAT_BACKEND", "mini")).lower()
-        self._lm = _load_backend(self.backend, model_path)
+        if lm is not None:
+            # Name it after the class so the Reply.source field stays informative.
+            self.backend = type(lm).__name__.removesuffix("LM").lower() or "lm"
+            self._lm = lm
+        else:
+            self.backend = (backend or os.environ.get("SODACHAT_BACKEND", "mini")).lower()
+            self._lm = _load_backend(self.backend, model_path)
 
     def _acceptable(self, candidate: str, user_text: str) -> bool:
         if not candidate or not _HAS_LETTER_RE.search(candidate):

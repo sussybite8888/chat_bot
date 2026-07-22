@@ -172,6 +172,10 @@ class SodaAgent:
         self._chat = None
         self._reader = None
         self._lms: dict = {}  # UnifiedLM/ExpertLM cache, keyed by checkpoint path
+        # ChatEngine wrapping an active LM, so MMI relevance reranking runs in
+        # every mode (not just specialist). Keyed by checkpoint path so the
+        # per-engine recent-reply deque persists across mode switches.
+        self._engines: dict = {}
         # Default to the task-routed expert model once it's been trained; it
         # chats, reads, and plays from one model with separated game/chat weights.
         self.mode = "expert" if (_MODELS / "expert.pt").exists() else "specialist"
@@ -218,6 +222,17 @@ class SodaAgent:
             self._chat = ChatEngine()
         return self._chat
 
+    def _engine_for(self, lm) -> "ChatEngine":
+        """Wrap an active LM (ExpertLM/UnifiedLM) in a ChatEngine so its chat
+        runs through MMI relevance reranking. Cached per checkpoint path."""
+        from .engine import ChatEngine
+
+        path = self._mode_path()
+        key = str(path) if path is not None else id(lm)
+        if key not in self._engines:
+            self._engines[key] = ChatEngine(lm=lm)
+        return self._engines[key]
+
     def _mode_path(self, mode: str | None = None):
         from .expert import DEFAULT_PATH as EXPERT_PATH
         from .instruct import OUT_PATH
@@ -244,10 +259,12 @@ class SodaAgent:
         return self._lms[path]
 
     def _chat_reply(self, text: str) -> str:
-        if (lm := self._active_lm()) is not None:  # unified or instruct mode
-            reply = lm.chat(self.history, text)
-            self.history.extend([text, reply])
-            return reply
+        if (lm := self._active_lm()) is not None:  # expert/unified/instruct mode
+            # Route through ChatEngine so MMI relevance reranking runs — the
+            # single-sample lm.chat() path ignores the prompt too often.
+            reply = self._engine_for(lm).reply(text, history=self.history)
+            self.history.extend([text, reply.text])
+            return reply.text
         reply = self._chat_engine().reply(text, history=self.history)
         self.history.extend([text, reply.text])
         return reply.text

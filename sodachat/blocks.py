@@ -35,6 +35,55 @@ def pick_device() -> str:
     return "cpu"
 
 
+def warp_logits(
+    logits: torch.Tensor,
+    seq: torch.Tensor | None,
+    temperature: float,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Turn raw last-position logits into a distribution ready for sampling.
+
+    `logits` is (B, V) — the logits at the position being generated. `seq` is
+    (B, T), the tokens generated so far, used only by the repetition penalty.
+    Applied in the conventional order:
+
+    1. **Repetition penalty** (CTRL, Keskar et al. 2019): each logit for a token
+       already in `seq` is divided by `repetition_penalty` if positive, else
+       multiplied by it, so >1 discourages repeats. This is what tames the
+       word-looping small models fall into; 1.0 is a no-op.
+    2. **Temperature.**
+    3. **Top-k**, then **nucleus (top-p)** — top-p keeps the smallest set of
+       most-likely tokens whose mass reaches `top_p`, a softer tail cut than a
+       fixed k. Filtered entries are set to -inf; the caller softmaxes.
+
+    Defaults are all no-ops so callers that pass only temperature/top_k behave
+    exactly as before.
+    """
+    if repetition_penalty != 1.0 and seq is not None and seq.numel():
+        for b in range(seq.shape[0]):
+            ids = torch.unique(seq[b])
+            picked = logits[b, ids]
+            logits[b, ids] = torch.where(
+                picked > 0, picked / repetition_penalty, picked * repetition_penalty
+            )
+    logits = logits / max(temperature, 1e-5)
+    if top_k:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float("inf")
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cumulative = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        remove = cumulative > top_p
+        # Keep the first token that crosses the threshold, so at least one
+        # candidate always survives.
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        logits[remove.scatter(1, sorted_idx, remove)] = -float("inf")
+    return logits
+
+
 @dataclass
 class GPTConfig:
     vocab_size: int
