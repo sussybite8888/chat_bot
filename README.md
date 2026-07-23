@@ -282,7 +282,14 @@ The interface has one rule: **plain text goes to the model**, and **game
 control is `/commands`** — `/play`, `/stop`, `/watch`, `/duel` (play snake
 against the bot, live), the exact, deterministic readouts `/score`, `/state`,
 `/board`, `/model`, and `/stats` (generation speed: tok/s, ms/reply, frequency).
-`/help` lists them. Each reply also shows its speed inline.
+Images are part of the conversation: **drop an image file into the chat**
+(or `/see <image>`) and the vision specialist says what it shows — a
+handwritten digit or a photo subject like a dog or a cat (works in any mode).
+The agent remembers what it saw, so a plain-text follow-up like *"what was in
+the picture?"* gets answered from it — the same pattern as the reader
+answering questions about the live game state — and the exchange lands in the
+chat history, so the chat model can keep talking about it. `/help` lists all
+commands. Each reply also shows its speed inline.
 
 `/model` shows the loaded models (params, architecture, training) and **switches
 which model powers the agent**, live:
@@ -427,6 +434,62 @@ in the agent and steer it live with `/goal`. Measured on the final model:
 directional goals ~83%, corner goals 100%, target goals 100% — instruction-
 following that generalizes to a game outside the training set.
 
+### Specialists the expert can load (image recognition as a plug-in)
+
+The task-routed split enables one more trick: **new capabilities as plug-in
+experts**. A *specialist* is a fresh FFN expert per block plus its own output
+head and special tokens, trained with the entire shared trunk **frozen** — so
+by construction its training cannot disturb chat, reading, or play (those
+weights never receive a gradient). It ships as a small standalone checkpoint,
+and `ExpertLM` auto-loads every `models/specialist-*.pt` at startup, grafting
+each one on as a new routed expert (`attach_specialist` in
+[expert.py](sodachat/expert.py)).
+
+The first specialist is **image recognition**
+([vision.py](sodachat/vision.py)): handwritten digits (MNIST) *and* everyday
+photo subjects (CIFAR-10 — airplane, automobile, bird, cat, deer, dog, frog,
+horse, ship, truck), 20 labels total. Images are rendered the way game boards
+are — as a glyph grid the tokenizer already reads. Any image is pooled to at
+most 16×16, and each cell becomes one character: a gray ramp `.:+#` where the
+cell is colorless, or a hue letter `r y g c b m` (uppercase = bright) where it
+has real color — so the model keeps the color signal that separates sky from
+fur. Dense rows keep an image at ~75–280 BPE tokens:
+
+```
+<|img|>
+BBBBBBBBBBBBBBBB      ← bright blue sky
+::+rrr+::+##+:::
+:+rrrrr+:+##+:::      ← red fuselage
+gggggggggggggggg      ← grass
+<|cls|>
+```
+
+The label reads off a 20-way class head at the trailing `<|cls|>` in a
+**single forward pass**, exactly how game moves read off the action head at
+`<|act|>`. The whole document routes to the vision expert, which is seeded
+from the *game* expert (glyph boards are the closest diet to a rendered
+image) and then specializes. Digits train with random polarity, so a photo of
+a pen-and-paper digit works without preprocessing; CIFAR trains with mirror
+augmentation. Expect digits to be near-perfect and object labels to be a good
+guess rather than an oracle — CIFAR-10 through a 16×16 glyph grid and a
+frozen text trunk is genuinely hard.
+
+```sh
+python -m sodachat.vision train    # needs models/expert.pt; trunk stays frozen
+python -m sodachat.vision eval     # held-out MNIST test accuracy
+python -m sodachat.vision demo     # print a few rendered digits + predictions
+```
+
+Once trained, the expert picks it up automatically — `/model` in the agent
+lists it under the expert, and dropping an image into the chat (or
+`/see <image-file>`) recognizes it, with plain-text follow-ups ("what was in
+the picture?") answered from what it saw — and `ExpertLM.classify("vision",
+doc)` (or `vision.classify(lm, pixels)`) does the same in code. Because a specialist's
+new tokens claim vocabulary ids at training time, specialists trained from
+the same base attach in the order they were trained; a specialist also
+records a fingerprint of the trunk it was trained against, so a stale one
+fails to load with a clear message instead of silently misfiring.
+
 ### Consistent latency (why real-time control works)
 
 For real-time control, *worst-case* latency matters more than the average — a
@@ -489,6 +552,8 @@ sodachat/
   unified.py      # one 30M dense model on the whole mixture -> models/unified.pt
   instruct.py     # VLA-style instruction post-train -> models/unified-instruct.pt
   expert.py       # task-routed experts: 1 model, separate game/chat FFNs -> models/expert.pt
+  vision.py       # image-recognition specialist (MNIST digits + CIFAR-10 objects),
+                  #   a frozen-trunk expert add-on -> models/specialist-vision.pt
   narrate.py      # multi-head model (MultiHeadGPT): action head + LM commentary in one pass
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/

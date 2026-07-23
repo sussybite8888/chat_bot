@@ -203,6 +203,7 @@ class SodaAgent:
         self.game = None  # interactive text game (tic-tac-toe)
         self.player = None
         self._counter = None  # tokenizer used only to count reply tokens
+        self.seen_image: dict | None = None  # what /see (or a dropped image) last saw
         self.stats = {"replies": 0, "tokens": 0, "seconds": 0.0}
         self.last = {"tokens": 0, "ms": 0.0, "tok_s": 0.0, "hz": 0.0}
 
@@ -216,6 +217,14 @@ class SodaAgent:
             if command is None:
                 return f"Unknown command /{name}. Try /help."
             return command(self, arg.strip())
+        # An image dropped into the chat (its path, quoted or bare) is looked
+        # at right away; plain-text questions that name it ("what's in the
+        # picture?") are answered from what was seen — the same pattern as the
+        # reader answering questions about the live game state.
+        if (img := self._find_image_path(s)) is not None:
+            return self._look_at(img, s)
+        if (answer := self._image_answer(s)) is not None:
+            return answer
         # plain text → the model. During tic-tac-toe a bare cell is a move I
         # reply to; a legal move goes to the game, other text is read against
         # the state. With a grid game running, questions read the live state.
@@ -274,6 +283,23 @@ class SodaAgent:
 
                 self._lms[path] = UnifiedLM(path, self.device)
         return self._lms[path]
+
+    def _vision_lm(self):
+        """The ExpertLM that hosts the vision specialist, for /see — available
+        in any mode. Reuses the expert model if it's already loaded (expert
+        mode caches it under the same path), else loads it once to host the
+        specialist. None if the expert or the vision specialist isn't trained."""
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+        from .vision import NAME
+
+        if not EXPERT_PATH.exists():
+            return None
+        if EXPERT_PATH not in self._lms:
+            from .expert import ExpertLM
+
+            self._lms[EXPERT_PATH] = ExpertLM(EXPERT_PATH, self.device)
+        lm = self._lms[EXPERT_PATH]
+        return lm if NAME in lm.specialists else None
 
     def _chat_reply(self, text: str) -> str:
         if (lm := self._active_lm()) is not None:  # expert/unified/instruct mode
@@ -380,6 +406,79 @@ class SodaAgent:
             self._reader = Reader()
         return self._reader.answer(fields, text) or self._chat_reply(text)
 
+    # ------------------------------------------------------- image understanding
+
+    _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+
+    def _find_image_path(self, text: str) -> Path | None:
+        """An existing image file mentioned in the message — a drag-and-dropped
+        path (the terminal pastes it quoted, spaces intact) or a bare token."""
+        import re
+
+        quoted = [a or b for a, b in re.findall(r"'([^']+)'|\"([^\"]+)\"", text)]
+        bare = [t.strip("'\"").rstrip("?!.,") for t in text.split()]
+        for cand in quoted + bare:
+            if cand.lower().endswith(self._IMAGE_EXTS):
+                path = Path(cand).expanduser()
+                if path.exists():
+                    return path
+        return None
+
+    @staticmethod
+    def _image_sentence(label: str, conf: float) -> str:
+        article = "an" if label[0] in "aeiou" or label == "8" else "a"
+        if conf >= 0.75:
+            return f"That's {article} {label} — I'm {conf:.0%} sure."
+        if conf >= 0.4:
+            return f"That looks like {article} {label} ({conf:.0%} sure)."
+        return f"I'm not certain — maybe {article} {label}? ({conf:.0%})"
+
+    def _look_at(self, path: Path, text: str = "") -> str:
+        """Classify an image with the vision specialist, remember the result
+        for follow-up questions, and put a clean version of the exchange in the
+        chat history so the conversation can continue about it."""
+        lm = self._vision_lm()
+        if lm is None:
+            return ("I see an image, but my vision specialist isn't trained yet:\n"
+                    "  python -m sodachat.vision train")
+        try:
+            import numpy as np
+            from PIL import Image
+
+            px = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        except Exception as e:
+            return f"Couldn't read {path.name} as an image: {e}"
+        from .vision import classify, render_image
+
+        label, conf = classify(lm, px)
+        self.seen_image = {"label": label, "conf": conf, "name": path.name}
+        sentence = self._image_sentence(label, conf)
+        # History gets the words, not the path or the glyph grid — the chat
+        # model should see "user showed a picture, I said dog", nothing weirder.
+        asked = " ".join(text.replace(f"'{path}'", "").replace(f'"{path}"', "")
+                         .replace(str(path), "").split())
+        self.history.extend([asked or "what is this image?", sentence])
+        return f"{render_image(px)}\n\n{sentence}"
+
+    def _image_answer(self, text: str) -> str | None:
+        """A deterministic answer for plain-text questions about the last seen
+        image ("what's in the picture?"), or None to fall through to chat."""
+        import re
+
+        low = text.lower()
+        if not re.search(r"\b(images?|pictures?|photos?|pics?|screenshots?)\b", low):
+            return None
+        if "?" not in text and not re.search(
+                r"\b(what|which|tell|guess|know|recognize|see|saw|seen|think)\b", low):
+            return None
+        if self.seen_image is None:
+            return ("I haven't seen an image yet — drop one into the chat "
+                    "(or /see <file>) and I'll take a look.")
+        seen = self.seen_image
+        answer = f"{self._image_sentence(seen['label'], seen['conf'])} ({seen['name']})"
+        self.history.extend([text, answer])
+        return answer
+
     # ------------------------------------------------------------- commands
 
     def _cmd_play(self, arg: str) -> str:
@@ -409,6 +508,26 @@ class SodaAgent:
 
     def _cmd_games(self, arg: str) -> str:
         return "Games: " + ", ".join(GAMES) + "."
+
+    def _cmd_see(self, arg: str) -> str:
+        """Recognize what an image shows — a handwritten digit or an everyday
+        photo subject (dog, cat, airplane, ...) — via the expert model's vision
+        specialist (see vision.py). Works in any mode. Dropping an image into
+        the chat (no command) does the same thing."""
+        raw = arg.strip()
+        if not raw:
+            return ("Usage: /see <image-file> — I'll say what's in it "
+                    "(a digit, or a photo subject like a dog or a cat). "
+                    "You can also just drop an image into the chat.")
+        # Dragging a file into the terminal pastes its path wrapped in quotes
+        # (e.g. '/Users/you/Desktop/Screenshot ....png') — strip a matching
+        # pair before treating it as a path, or the quotes become part of it.
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            raw = raw[1:-1]
+        path = Path(raw).expanduser()
+        if not path.exists():
+            return f"No such file: {path}"
+        return self._look_at(path)
 
     def _cmd_duel(self, arg: str) -> str:
         # The live duel takes over the terminal, so the terminal loop runs it
@@ -521,6 +640,13 @@ class SodaAgent:
             )
 
         row("expert", EXPERT_PATH, EXPERT_PATH in self._lms)
+        # Pluggable specialists the expert grafts on at load (expert.py) — e.g.
+        # vision (image -> digit). Trained separately, auto-loaded with the expert.
+        for spec in sorted(_MODELS.glob("specialist-*.pt")):
+            name = spec.stem.removeprefix("specialist-")
+            loaded = (EXPERT_PATH in self._lms
+                      and name in getattr(self._lms[EXPERT_PATH], "specialists", {}))
+            row(f"└ {name} specialist", spec, loaded)
         row("chat", DEFAULT_MODEL_PATH, self._chat is not None)
         row("reader", READER_PATH, self._reader is not None)
         row("unified", UNIFIED_PATH, UNIFIED_PATH in self._lms)
@@ -553,6 +679,8 @@ _COMMANDS = {
     "status": SodaAgent._cmd_state,
     "board": SodaAgent._cmd_board,
     "games": SodaAgent._cmd_games,
+    "see": SodaAgent._cmd_see,
+    "recognize": SodaAgent._cmd_see,
     "model": SodaAgent._cmd_model,
     "info": SodaAgent._cmd_model,
     "goal": SodaAgent._cmd_goal,
@@ -570,6 +698,7 @@ _HELP = [
     ("/board", "print the board now"),
     ("/watch", "stream the live board for a few seconds"),
     ("/games", "list games"),
+    ("/see <image>", "say what an image shows (or just drop an image into the chat)"),
     ("/model", "show models, or switch: expert | specialist | unified | instruct"),
     ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),

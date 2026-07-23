@@ -3,6 +3,8 @@ torch>=2.6
 transformers>=4.44
 datasets>=3.0
 numpy>=1.26
+pillow>=10.0
+
 rich>=13.7
 pygame-ce>=2.5
 discord.py>=2.4

@@ -20,11 +20,14 @@ Each model = an architecture + its data/training/inference, in one file:
     unified       unified.py    MiniGPT          UnifiedLM         unified.pt
     instruct      instruct.py   MiniGPT          InstructPlayer    unified-instruct.pt
     expert        expert.py     ExpertGPT        ExpertLM          expert.pt
+    vision        vision.py     (expert add-on)  via ExpertLM      specialist-vision.pt
 
 Architectures:
     MiniGPT       (model.py)   base decoder LM — chat, reader, games, unified, instruct
     MultiHeadGPT  (narrate.py) MiniGPT + an action head (text + move, one pass)
-    ExpertGPT     (expert.py)  task-routed FFN experts (text vs game) + action head
+    ExpertGPT     (expert.py)  task-routed FFN experts (text vs game) + action head;
+                               loads *specialists* (frozen-trunk add-on experts with
+                               their own heads, e.g. vision) from specialist-*.pt
 
 The agent (agent.py) ties chat + games together and can run any of the single
 models via /model. Frontends: cli.py (terminal), discord_bot.py, google_chat.py.

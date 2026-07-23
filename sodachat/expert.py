@@ -17,6 +17,15 @@ Two output heads, as before: the LM head (text) and the action head (moves).
 Warm-starts from a plain MiniGPT checkpoint (e.g. unified.pt): shared params
 copy over, and the single pretrained FFN is duplicated into both experts so
 each starts from a competent initialization (see `from_minigpt`).
+
+The expert slots are also **pluggable**: a new capability can be trained as a
+*specialist* — a fresh FFN expert per block plus its own output head and any
+new special tokens, trained with the whole shared trunk frozen — and saved as a
+small standalone checkpoint (`models/specialist-<name>.pt`). `ExpertLM`
+auto-loads every such file at startup, grafting each one onto the model as a
+new routed expert (`attach_specialist`), so capabilities can be added after the
+fact without touching the base weights. `vision.py` (image recognition) is the
+first one; `scaffold_specialist` / `save_specialist` are the training-side API.
 """
 
 from __future__ import annotations
@@ -115,6 +124,8 @@ class ExpertGPT(nn.Module):
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
         self.action_head = nn.Linear(cfg.n_embd, n_actions)
+        self.heads = nn.ModuleDict()  # specialist heads, keyed by specialist name
+        self.specialists: dict[str, dict] = {}  # name -> {task, labels, ...}
         self.apply(self._init)
         import math
 
@@ -145,13 +156,18 @@ class ExpertGPT(nn.Module):
             self._rope[key] = c
         return c[0][:T], c[1][:T]
 
-    def forward(self, idx: torch.Tensor, task: torch.Tensor):
-        """idx, task: (B, T). Returns (lm_logits [B,T,V], action_logits [B,T,A])."""
+    def _features(self, idx: torch.Tensor, task: torch.Tensor) -> torch.Tensor:
+        """The shared trunk: embeddings -> routed blocks -> final norm. Every
+        head (LM, action, specialist) reads from this."""
         x = self.drop(self.tok_emb(idx))
         cos, sin = self._rope_for(idx.shape[1], x.device, x.dtype)
         for block in self.blocks:
             x = block(x, cos, sin, task)
-        x = self.ln_f(x)
+        return self.ln_f(x)
+
+    def forward(self, idx: torch.Tensor, task: torch.Tensor):
+        """idx, task: (B, T). Returns (lm_logits [B,T,V], action_logits [B,T,A])."""
+        x = self._features(idx, task)
         return self.lm_head(x), self.action_head(x)
 
     @torch.no_grad()
@@ -185,6 +201,91 @@ class ExpertGPT(nn.Module):
         whole board routed to the GAME expert. One forward pass, no sampling."""
         task = torch.full_like(idx, GAME)
         return self(idx, task)[1][:, -1, :]
+
+    @torch.no_grad()
+    def specialist_logits(self, idx, name: str):
+        """A specialist head's logits at the final position (its `<|cls|>`-style
+        token), the whole prompt routed to that specialist's expert."""
+        task = torch.full_like(idx, self.specialists[name]["task"])
+        return self.heads[name](self._features(idx, task)[:, -1, :])
+
+    # ------------------------------------------------- pluggable specialists
+
+    def grow_vocab(self, new_size: int) -> None:
+        """Enlarge the embedding (and the tied LM head) for newly added special
+        tokens. Old rows are preserved; new rows get a fresh init."""
+        old = self.tok_emb.weight.data
+        emb = nn.Embedding(new_size, self.cfg.n_embd).to(old.device)
+        nn.init.normal_(emb.weight, std=0.02)
+        with torch.no_grad():
+            emb.weight[: old.shape[0]] = old
+        self.tok_emb = emb
+        self.lm_head = nn.Linear(self.cfg.n_embd, new_size, bias=False).to(old.device)
+        self.lm_head.weight = self.tok_emb.weight
+        self.cfg.vocab_size = new_size
+
+    def add_expert(self, seed_from: int | None = None) -> int:
+        """Append one fresh FFN expert to every block (a new routed slot),
+        optionally seeded from an existing expert's weights. Returns its task id."""
+        device = self.tok_emb.weight.device
+        for block in self.blocks:
+            expert = SwiGLU(self.cfg).to(device)
+            if seed_from is not None:
+                expert.load_state_dict(block.ffn.experts[seed_from].state_dict())
+            block.ffn.experts.append(expert)
+        self.n_experts += 1
+        return self.n_experts - 1
+
+    def _trunk_sig(self) -> float:
+        # A cheap fingerprint of the frozen shared trunk. A specialist is only
+        # valid against the exact trunk it was trained on (its expert learned
+        # to read *these* attention features), so attach checks this.
+        return float(self.blocks[0].attn.qkv.weight.detach().float().sum())
+
+    def attach_specialist(self, ck: dict, tok) -> int:
+        """Graft a trained specialist checkpoint (see `save_specialist`) onto
+        this model: add its special tokens (with their trained embedding rows),
+        append its FFN expert to every block, and register its head. Returns
+        the task id the specialist was routed to."""
+        name = ck["specialist"]
+        if name in self.specialists:
+            raise ValueError(f"specialist {name!r} is already attached")
+        for k in ("n_layer", "n_embd", "n_head"):
+            if ck["config"][k] != getattr(self.cfg, k):
+                raise ValueError(f"specialist {name!r} was trained for a "
+                                 f"{ck['config']['n_layer']}L/{ck['config']['n_embd']}d "
+                                 f"trunk, this model is "
+                                 f"{self.cfg.n_layer}L/{self.cfg.n_embd}d")
+        if abs(self._trunk_sig() - ck["trunk_sig"]) > 1e-2:
+            raise ValueError(f"specialist {name!r} was trained against a different "
+                             f"expert checkpoint — retrain it against this one")
+        # 1) vocabulary: re-add the specialist's special tokens. Ids must land
+        # where they were at training time (they index the embedding), so
+        # specialists trained from the same base must attach in training order.
+        token_ids = ck["token_ids"]
+        tok.add_special(list(token_ids))
+        for t, want in token_ids.items():
+            if tok.token_id(t) != want:
+                raise ValueError(f"token {t!r} resolved to id {tok.token_id(t)}, "
+                                 f"trained as {want} — attach specialists in the "
+                                 f"order they were trained")
+        if len(tok) > self.cfg.vocab_size:
+            self.grow_vocab(len(tok))
+        with torch.no_grad():
+            for t, i in token_ids.items():
+                self.tok_emb.weight[i] = ck["emb_rows"][t].to(self.tok_emb.weight.device)
+        # 2) a fresh expert slot + the head, then load the trained weights
+        task = self.add_expert()
+        head_w = ck["state_dict"][f"heads.{name}.weight"]
+        self.heads[name] = nn.Linear(self.cfg.n_embd, head_w.shape[0]).to(
+            self.tok_emb.weight.device)
+        src = {k.replace(f".experts.{ck['task_trained']}.", f".experts.{task}."): v
+               for k, v in ck["state_dict"].items()}
+        result = self.load_state_dict(src, strict=False)
+        assert not result.unexpected_keys, result.unexpected_keys
+        self.specialists[name] = {"task": task, "labels": ck["labels"],
+                                  **ck.get("meta", {})}
+        return task
 
     @classmethod
     def from_minigpt(cls, state_dict: dict, cfg: GPTConfig, n_actions: int,
@@ -535,22 +636,138 @@ def load(path=DEFAULT_PATH, device=None):
     return model, tok, ck.get("action_vocab", ACTION_VOCAB)
 
 
+# ------------------------------------------------------- specialist training
+#
+# A specialist = one fresh FFN expert per block + its own head + any new
+# special tokens, trained with the whole shared trunk frozen. It ships as a
+# small standalone checkpoint that `attach_specialist` grafts back on at load
+# time, so new capabilities never touch (or risk) the base model's weights.
+
+
+def scaffold_specialist(base=DEFAULT_PATH, *, name: str, special_tokens: list[str],
+                        n_labels: int, seed_from: int = GAME, device=None):
+    """Load the trained expert model and bolt on an empty specialist: the new
+    special tokens (fresh embedding rows), a new FFN expert per block (seeded
+    from an existing expert — GAME by default, since its glyph-grid diet is the
+    closest thing to most new modalities), and an `n_labels`-way head.
+
+    Everything shared is frozen, so specialist training cannot disturb chat,
+    reading, or play: only the new expert, the head, and the new tokens'
+    embedding rows receive gradients (old embedding rows are pinned by a
+    gradient mask — the embedding is one tensor, tied to the LM head).
+
+    Returns (model, tok, task_id)."""
+    device = device or pick_device()
+    model, tok, _ = load(base, device)
+    old_v = len(tok)
+    new_v = tok.add_special(special_tokens)
+    model.grow_vocab(new_v)
+    task = model.add_expert(seed_from)
+    model.heads[name] = nn.Linear(model.cfg.n_embd, n_labels).to(device)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for block in model.blocks:
+        for p in block.ffn.experts[task].parameters():
+            p.requires_grad_(True)
+    for p in model.heads[name].parameters():
+        p.requires_grad_(True)
+    w = model.tok_emb.weight
+    w.requires_grad_(True)
+    mask = torch.zeros(new_v, 1, device=device)
+    mask[old_v:] = 1.0
+    w.register_hook(lambda g: g * mask)
+    return model, tok, task
+
+
+def specialist_param_groups(model: ExpertGPT, weight_decay: float = 0.05) -> list[dict]:
+    """Optimizer param groups for a scaffolded specialist. The embedding must
+    sit in a no-decay group: the gradient mask pins the old rows' *gradients*,
+    but AdamW's decoupled weight decay shrinks every row of any decayed
+    parameter regardless of gradient — which would quietly erode the frozen
+    vocabulary the specialist trains against."""
+    emb = model.tok_emb.weight
+    rest = [p for p in model.parameters() if p.requires_grad and p is not emb]
+    return [{"params": rest, "weight_decay": weight_decay},
+            {"params": [emb], "weight_decay": 0.0}]
+
+
+def save_specialist(path, model: ExpertGPT, tok, *, name: str, task: int,
+                    labels: list[str], special_tokens: list[str],
+                    steps: int, val_acc: float, meta: dict | None = None) -> None:
+    """Persist just the specialist's parameters: its per-block FFN expert, its
+    head, and the embedding rows of its special tokens — keyed exactly as they
+    will live in the grafted model, so `attach_specialist` is a partial
+    state-dict load."""
+    sd = model.state_dict()
+    keep = {k: v.detach().cpu().clone() for k, v in sd.items()
+            if f".experts.{task}." in k or k.startswith(f"heads.{name}.")}
+    token_ids = {t: tok.token_id(t) for t in special_tokens}
+    emb_rows = {t: model.tok_emb.weight[i].detach().cpu().clone()
+                for t, i in token_ids.items()}
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "specialist": name,
+        "config": asdict(model.cfg),
+        "state_dict": keep,
+        "task_trained": task,
+        "token_ids": token_ids,
+        "emb_rows": emb_rows,
+        "labels": labels,
+        "trunk_sig": model._trunk_sig(),
+        "meta": meta or {},
+        "steps": steps,
+        "val_acc": val_acc,
+    }, path)
+
+
 # ------------------------------------------------------------------- inference
 
 
 class ExpertLM:
     """One model, routed by task: chat/read use the text expert + LM head;
-    game moves use the game expert + action head (a single forward pass)."""
+    game moves use the game expert + action head (a single forward pass).
 
-    def __init__(self, path=DEFAULT_PATH, device=None):
+    Trained specialists (`models/specialist-*.pt`) are grafted on at startup —
+    each adds a routed expert and a head (e.g. `vision`: image -> digit via
+    `classify`). Pass `specialists=[]` to load the base model alone, or a list
+    of paths to pick exactly which ones."""
+
+    def __init__(self, path=DEFAULT_PATH, device=None, specialists="auto"):
         device = device or "cpu"
         if device == "cpu":
             torch.set_num_threads(1)
         self.model, self.tok, self.actions = load(path, device)
         self.device = device
+        if specialists == "auto":
+            specialists = sorted(_MODELS.glob("specialist-*.pt"))
+        for p in specialists:
+            try:
+                self.load_specialist(p)
+            except Exception as e:  # a bad specialist never takes down the model
+                print(f"[expert] skipping specialist {Path(p).name}: {e}")
         self._nl = self.tok.encode("\n")[0]
         self._end = self.tok.token_id(END)
         self.block = self.model.cfg.block_size
+
+    @property
+    def specialists(self) -> dict:
+        return self.model.specialists
+
+    def load_specialist(self, path) -> str:
+        """Attach one specialist checkpoint; returns its name."""
+        ck = torch.load(path, map_location=self.device, weights_only=True)
+        self.model.attach_specialist(ck, self.tok)
+        return ck["specialist"]
+
+    @torch.no_grad()
+    def classify(self, name: str, prompt: str) -> tuple[str, float]:
+        """Run a specialist classifier: one forward pass through its expert,
+        label read off its head at the prompt's final (`<|cls|>`) token.
+        Returns (label, confidence)."""
+        logits = self.model.specialist_logits(self._ids(prompt), name)[0]
+        probs = F.softmax(logits.float(), dim=-1)
+        i = int(probs.argmax())
+        return self.model.specialists[name]["labels"][i], float(probs[i])
 
     def _ids(self, prompt):
         ids = self.tok.encode(prompt)[-self.block:]
