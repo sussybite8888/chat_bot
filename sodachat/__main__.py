@@ -1,3 +1,3 @@
-from .cli import main
+from .agent import main
 
 main()

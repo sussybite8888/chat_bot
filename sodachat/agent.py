@@ -175,7 +175,7 @@ class _ExpertPlayer:
         legal = [a for a in game.ACTIONS if game.legal(a)]
         goal = self.agent.goal if self.agent.goal_set else None
         t0 = time.perf_counter()
-        move = self.lm.move(game.NAME, game.render(), legal, goal=goal)
+        move = self.lm.move(game.NAME, game.model_board(), legal, goal=goal)
         self.last_ms = (time.perf_counter() - t0) * 1000
         return move
 
@@ -190,12 +190,13 @@ class SodaAgent:
         # every mode (not just specialist). Keyed by checkpoint path so the
         # per-engine recent-reply deque persists across mode switches.
         self._engines: dict = {}
-        # Default to the specialist models: after the boards were enlarged to
-        # 20x20, they are the ones retrained to perceive the new size. The 30M
-        # expert/unified models still read the old board size, so they stay
-        # opt-in (/model expert) until retrained — chat/read are unaffected, but
-        # their game moves would be out-of-distribution on the bigger boards.
-        self.mode = "specialist"
+        # Default to the task-routed expert: one model that chats, reads, plays
+        # every game (goal-conditioned), and hosts the vision specialist. Once it
+        # was retrained on the 20x20 boards — reading the compact `model_board()`
+        # ASCII, so a full board fits the context — it plays snake *better* than
+        # the dedicated specialist (26 vs 12) and ties dodge, while keeping chat.
+        # Switch to per-task specialists with /model specialist (still best at pong).
+        self.mode = "expert"
         self.goal = "eat the food"  # instruction used for moves (instruct/expert)
         self.goal_set = False  # True once the user picks a goal with /goal
         self.history: list[str] = []
@@ -204,6 +205,7 @@ class SodaAgent:
         self.player = None
         self._counter = None  # tokenizer used only to count reply tokens
         self.seen_image: dict | None = None  # what /see (or a dropped image) last saw
+        self.seen_code: dict | None = None   # what /code (or a dropped source file) last read
         self.stats = {"replies": 0, "tokens": 0, "seconds": 0.0}
         self.last = {"tokens": 0, "ms": 0.0, "tok_s": 0.0, "hz": 0.0}
 
@@ -224,6 +226,17 @@ class SodaAgent:
         if (img := self._find_image_path(s)) is not None:
             return self._look_at(img, s)
         if (answer := self._image_answer(s)) is not None:
+            return answer
+        # A source file dropped into the chat is read by the code specialist —
+        # it names the language (and can continue it). Same pattern as /see.
+        if (code := self._find_code_path(s)) is not None:
+            return self._read_code(code, s)
+        # "write a function that ..." → the code-generation specialist. Checked
+        # before code Q&A so "can you write code that ...?" generates rather than
+        # being read as a question about a previously-seen file.
+        if (answer := self._code_gen_answer(s)) is not None:
+            return answer
+        if (answer := self._code_answer(s)) is not None:
             return answer
         # plain text → the model. During tic-tac-toe a bare cell is a move I
         # reply to; a legal move goes to the game, other text is read against
@@ -292,14 +305,27 @@ class SodaAgent:
         from .expert import DEFAULT_PATH as EXPERT_PATH
         from .vision import NAME
 
-        if not EXPERT_PATH.exists():
-            return None
-        if EXPERT_PATH not in self._lms:
-            from .expert import ExpertLM
+        return self._specialist_lm(EXPERT_PATH, NAME)
 
-            self._lms[EXPERT_PATH] = ExpertLM(EXPERT_PATH, self.device)
-        lm = self._lms[EXPERT_PATH]
-        return lm if NAME in lm.specialists else None
+    def _code_lm(self):
+        """The ExpertLM that hosts the code specialist, for /code — available
+        in any mode. None if the expert or the code specialist isn't trained."""
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+        from .code import NAME
+
+        return self._specialist_lm(EXPERT_PATH, NAME)
+
+    def _specialist_lm(self, expert_path, name: str):
+        """Shared backing for _vision_lm / _code_lm: ensure the expert model is
+        loaded and return it iff the named specialist is attached, else None."""
+        from .expert import ExpertLM
+
+        if not expert_path.exists():
+            return None
+        if expert_path not in self._lms:
+            self._lms[expert_path] = ExpertLM(expert_path, self.device)
+        lm = self._lms[expert_path]
+        return lm if name in lm.specialists else None
 
     def _chat_reply(self, text: str) -> str:
         if (lm := self._active_lm()) is not None:  # expert/unified/instruct mode
@@ -409,16 +435,30 @@ class SodaAgent:
     # ------------------------------------------------------- image understanding
 
     _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+    _CODE_EXTS = (".py", ".js", ".ts", ".java", ".c", ".h", ".cpp", ".cc", ".hpp",
+                  ".go", ".rb", ".php", ".rs", ".sh", ".swift", ".kt")
 
     def _find_image_path(self, text: str) -> Path | None:
         """An existing image file mentioned in the message — a drag-and-dropped
         path (the terminal pastes it quoted, spaces intact) or a bare token."""
+        return self._find_file_path(text, self._IMAGE_EXTS)
+
+    def _find_code_path(self, text: str) -> Path | None:
+        """Same idea as `_find_image_path`, for source files dropped into the
+        chat — routed to the code specialist (/code, or a bare .py file)."""
+        return self._find_file_path(text, self._CODE_EXTS)
+
+    @staticmethod
+    def _find_file_path(text: str, exts) -> Path | None:
+        """An existing file (by extension) mentioned in the message — a drag-
+        and-dropped path (the terminal pastes it quoted, spaces intact) or a
+        bare token."""
         import re
 
         quoted = [a or b for a, b in re.findall(r"'([^']+)'|\"([^\"]+)\"", text)]
         bare = [t.strip("'\"").rstrip("?!.,") for t in text.split()]
         for cand in quoted + bare:
-            if cand.lower().endswith(self._IMAGE_EXTS):
+            if cand.lower().endswith(exts):
                 path = Path(cand).expanduser()
                 if path.exists():
                     return path
@@ -479,6 +519,160 @@ class SodaAgent:
         self.history.extend([text, answer])
         return answer
 
+    # The code specialist mirrors the vision one: a dropped source file is
+    # classified (and optionally continued), the result is remembered so a
+    # plain-text follow-up can ask about it, and the exchange lands in the
+    # chat history so the conversation can keep going.
+
+    def _read_code(self, path: Path, text: str = "") -> str:
+        """Classify a source file's language with the code specialist, remember
+        the result for follow-ups, and put a clean version of the exchange in
+        the chat history. If the message says "complete", also continue it."""
+        lm = self._code_lm()
+        if lm is None:
+            return ("I see a source file, but my code specialist isn't trained yet:\n"
+                    "  python -m sodachat.code train")
+        try:
+            snippet = path.read_text(errors="replace")
+        except Exception as e:
+            return f"Couldn't read {path.name}: {e}"
+        from .code import classify, complete
+
+        snippet = snippet.strip()
+        if not snippet:
+            return f"{path.name} looks empty."
+        # A small, stable prefix is enough to identify a language and keeps the
+        # log readable; full completion only when asked for it.
+        want_complete = "complete" in text.lower() or "finish" in text.lower()
+        label, conf = classify(lm, snippet)
+        self.seen_code = {"label": label, "conf": conf, "name": path.name}
+        sentence = self._code_sentence(label, conf)
+        body = sentence
+        if want_complete:
+            cont = complete(lm, snippet)
+            body = f"{sentence}\n\ncontinuation:\n{cont}" if cont else sentence
+        asked = " ".join(text.replace(f"'{path}'", "").replace(f'"{path}"', "")
+                         .replace(str(path), "").split())
+        self.history.extend([asked or f"what language is {path.name}?", sentence])
+        return body
+
+    def _code_sentence(self, label: str, conf: float) -> str:
+        if conf >= 0.75:
+            return f"That's {label} — I'm {conf:.0%} sure."
+        if conf >= 0.4:
+            return f"That looks like {label} ({conf:.0%} sure)."
+        return f"I'm not certain — maybe {label}? ({conf:.0%})"
+
+    # A natural-language request to *write* code ("write a python function that
+    # reverses a string") is routed by the main loop to the code-generation
+    # specialist (codegen.py). The specialist is a completer, not an instruction
+    # model, so the request is turned into a seed — a comment describing the task
+    # plus a function header — that it continues into code.
+    _SEED = {  # language -> (line-comment marker, function opener)
+        "python": ("#", "def "), "javascript": ("//", "function "),
+        "typescript": ("//", "function "), "go": ("//", "func "),
+        "ruby": ("#", "def "), "php": ("//", "function "),
+        "java": ("//", ""), "c": ("//", ""), "cpp": ("//", ""),
+    }
+
+    def _codegen_lm(self):
+        """The ExpertLM hosting the code-*generation* specialist, for /gen and
+        "write a function ..." requests. None if it isn't trained yet."""
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+
+        return self._specialist_lm(EXPERT_PATH, "codegen")
+
+    def _codegen_seed(self, text: str, force: bool = False):
+        """Turn a request into a (language, seed) pair the codegen completer can
+        continue, or None if `text` isn't a code-generation request (unless
+        `force`, as from the explicit /gen command)."""
+        import re
+
+        low = f" {text.lower()} "
+        verb = (r"(write|generate|create|implement|make|code up|build|give me|"
+                r"show me|need|want)")
+        noun = (r"(function|method|def|class|program|script|snippet|code|"
+                r"algorithm|routine|one[- ]?liner)")
+        langs = r"(python|py|javascript|js|node|typescript|ts|java|c\+\+|cpp|golang|go|ruby|php)"
+        if not force and not (
+                (re.search(rf"\b{verb}\b", low) and re.search(rf"\b{noun}\b", low))
+                or re.search(rf"\b{langs}\b[^.]*\b{noun}\b", low)):
+            return None
+        lang = "python"
+        for key, canon in (("python", "python"), (" py ", "python"),
+                           ("typescript", "typescript"), (" ts ", "typescript"),
+                           ("javascript", "javascript"), (" js ", "javascript"),
+                           ("node", "javascript"), ("c++", "cpp"), (" cpp ", "cpp"),
+                           ("java", "java"), ("golang", "go"), (" go ", "go"),
+                           ("ruby", "ruby"), ("php", "php"), (" c ", "c")):
+            if key in low:
+                lang = canon
+                break
+        comment, opener = self._SEED[lang]
+        m = re.search(r"\b(?:called|named)\s+([A-Za-z_]\w*)", text)
+        name = m.group(1) if m else self._derive_name(text)
+        desc = " ".join(text.split()).rstrip(".!?") or "a helper"
+        # Seed the signature start (name + "(") so the model completes params and
+        # body on-topic; langs with no simple opener (java/c/cpp) just get the
+        # describing comment and generate from there.
+        head = f"{opener}{name}(" if (opener and name) else opener
+        return lang, f"{comment} {desc}\n{head}"
+
+    _NAME_STOP = frozenset(
+        "write writes generate create creates implement make makes build given "
+        "give show need want a an the some this that these those function method "
+        "def class program script snippet code algorithm routine oneliner one "
+        "liner to which for in on of and or with using please could can you my me "
+        "it is python py javascript js node typescript ts java golang go ruby php "
+        "cpp c takes take returns return string".split())
+
+    def _derive_name(self, text: str) -> str:
+        """A snake_case function name from the request's content words, so the
+        signature is on-topic ('reverse a string' -> reverse_string)."""
+        import re
+
+        words = [w for w in re.findall(r"[a-z]+", text.lower())
+                 if w not in self._NAME_STOP]
+        return "_".join(words[:3])
+
+    def _run_codegen(self, echo: str, lang: str, seed: str) -> str:
+        lm = self._codegen_lm()
+        if lm is None:
+            return ("I'd generate that, but my code-generation specialist isn't "
+                    "trained yet:\n  python -m sodachat.codegen train")
+        from .codegen import generate
+
+        code = (seed + generate(lm, seed, max_new_tokens=160)).rstrip()
+        # History keeps the words, not the code block, so chat stays coherent.
+        self.history.extend([" ".join(echo.split()), f"(generated {lang} code)"])
+        return (f"Here's some {lang} — generated by a small model, so read it "
+                f"before trusting it:\n\n{code}")
+
+    def _code_gen_answer(self, text: str) -> str | None:
+        """Generate code for a natural-language request, or None to fall through
+        to chat. This is the main loop 'activating' the codegen specialist."""
+        seeded = self._codegen_seed(text)
+        return None if seeded is None else self._run_codegen(text, *seeded)
+
+    def _code_answer(self, text: str) -> str | None:
+        """A deterministic answer for plain-text questions about the last seen
+        source file ("what language was that?"), or None to fall through."""
+        import re
+
+        low = text.lower()
+        if not re.search(r"\b(language|lang|code|file|snippet|written in|in)\b", low):
+            return None
+        if "?" not in text and not re.search(
+                r"\b(what|which|tell|guess|know|recognize|see|saw|seen|think)\b", low):
+            return None
+        if self.seen_code is None:
+            return ("I haven't read any code yet — drop a source file into the "
+                    "chat (or /code <file>) and I'll name its language.")
+        seen = self.seen_code
+        answer = f"{self._code_sentence(seen['label'], seen['conf'])} ({seen['name']})"
+        self.history.extend([text, answer])
+        return answer
+
     # ------------------------------------------------------------- commands
 
     def _cmd_play(self, arg: str) -> str:
@@ -528,6 +722,41 @@ class SodaAgent:
         if not path.exists():
             return f"No such file: {path}"
         return self._look_at(path)
+
+    def _cmd_code(self, arg: str) -> str:
+        """Name a source file's programming language (and, with `complete`,
+        continue it) via the expert model's code specialist (see code.py). Works
+        in any mode. Dropping a source file into the chat does the same thing."""
+        raw = arg.strip()
+        if not raw:
+            return ("Usage: /code <source-file> [complete] — I'll name its "
+                    "language (python, java, javascript, php, ruby, go). Add "
+                    "`complete` and I'll continue it too. You can also just "
+                    "drop a source file into the chat.")
+        # `complete` is an optional trailing flag, not part of the path.
+        want_complete = False
+        parts = raw.split()
+        if parts and parts[-1].lower() in ("complete", "finish", "continue"):
+            want_complete = True
+            raw = " ".join(parts[:-1])
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+            raw = raw[1:-1]
+        path = Path(raw).expanduser()
+        if not path.exists():
+            return f"No such file: {path}"
+        flag = " complete" if want_complete else ""
+        return self._read_code(path, flag)
+
+    def _cmd_gen(self, arg: str) -> str:
+        """Generate code from a description via the code-generation specialist:
+        `/gen a python function that reverses a string`. In plain chat the same
+        request ('write a function ...') is routed here automatically."""
+        if not arg.strip():
+            return ("Usage: /gen <description> — e.g. `/gen a python function "
+                    "that reverses a string`. Or just ask in chat: "
+                    "'write a js function to debounce a callback'.")
+        lang, seed = self._codegen_seed(arg, force=True)
+        return self._run_codegen(arg, lang, seed)
 
     def _cmd_duel(self, arg: str) -> str:
         # The live duel takes over the terminal, so the terminal loop runs it
@@ -681,6 +910,10 @@ _COMMANDS = {
     "games": SodaAgent._cmd_games,
     "see": SodaAgent._cmd_see,
     "recognize": SodaAgent._cmd_see,
+    "code": SodaAgent._cmd_code,
+    "lang": SodaAgent._cmd_code,
+    "gen": SodaAgent._cmd_gen,
+    "generate": SodaAgent._cmd_gen,
     "model": SodaAgent._cmd_model,
     "info": SodaAgent._cmd_model,
     "goal": SodaAgent._cmd_goal,
@@ -699,6 +932,10 @@ _HELP = [
     ("/watch", "stream the live board for a few seconds"),
     ("/games", "list games"),
     ("/see <image>", "say what an image shows (or just drop an image into the chat)"),
+    ("/code <file>", "name a source file's language (or drop a .py/.js/... into the chat);"
+     " add `complete` to continue it"),
+    ("/gen <description>", "generate code from a description (or just ask in chat:"
+     " 'write a python function that ...')"),
     ("/model", "show models, or switch: expert | specialist | unified | instruct"),
     ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),

@@ -27,6 +27,9 @@ class SnakeGame(Game):
         HEAD: ("█", "bright_green"),
         FOOD: ("●", "red"),
     }
+    # head '@' vs body '#' (render() shows both as █, so the LM couldn't tell
+    # them apart); food '*'. Matches sandbox's agent/target so VLA transfers.
+    MODEL_GLYPHS = {EMPTY: ".", BODY: "#", HEAD: "@", FOOD: "*"}
 
     def reset(self) -> "SnakeGame":
         c = self.SIZE[0] // 2

@@ -40,6 +40,16 @@ class Game:
     MODALITY: str = "grid"  # "grid" or "text"
     ACTIONS: tuple[str, ...] = ()
     GLYPHS: dict[int, tuple[str, str]] = {}
+    # Model-facing glyphs: one ASCII *byte* per cell value, for the text board an
+    # LM reads (see `model_board`). GLYPHS above are for humans — box-drawing and
+    # block characters that look good in a terminal but are 2-3 bytes each, so a
+    # 20x20 board tokenizes to ~800 subwords and blows past the block size; worse,
+    # snake's head and body share one glyph (they differ only by colour, which the
+    # text board drops), so the LM can't even see where its head is. ASCII bytes
+    # fix both: ~1 token/cell and a distinct char per value. Convention across
+    # games so instruction-following transfers: '.' empty, '@' the controlled
+    # entity, '#' obstacle, '*' the objective.
+    MODEL_GLYPHS: dict[int, str] = {}
     # Whether the unified/expert training corpora include this game. Set False
     # for held-out probe games (see sandbox.py) that must stay unseen so they
     # measure zero-shot transfer, not memorization.
@@ -96,6 +106,19 @@ class Game:
                 for row in grid
             )
         return str(self.observe())
+
+    def model_board(self) -> str:
+        """The board an LM reads (expert/unified movers): compact single-byte
+        ASCII per cell (MODEL_GLYPHS), ~8x fewer tokens than `render()` and with
+        every cell value distinct. Falls back to `render()` for text games (whose
+        board is already a compact character stream) or if MODEL_GLYPHS is unset."""
+        if self.MODALITY == "grid" and self.MODEL_GLYPHS:
+            grid, _ = self.observe()
+            return "\n".join(
+                "".join(self.MODEL_GLYPHS.get(int(v), "?") for v in row)
+                for row in grid
+            )
+        return self.render()
 
     def facts(self) -> dict[str, str]:
         """Queryable facts about the current state, for grounded Q&A. Games

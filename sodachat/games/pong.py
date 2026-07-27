@@ -33,6 +33,8 @@ class PongGame(Game):
         BALL: ("●", "bright_yellow"),
         PADDLE: ("█", "cyan"),
     }
+    # paddle '@' (the controlled entity), ball '*' (the objective to track).
+    MODEL_GLYPHS = {EMPTY: ".", BALL: "*", PADDLE: "@"}
 
     def reset(self) -> "PongGame":
         self.pad = self.rows // 2 - _PAD // 2  # top row of paddle

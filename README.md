@@ -140,11 +140,12 @@ nothing — on a tight machine use `--batch-size 16`.
 ## Terminal chat
 
 ```sh
-.venv/bin/python -m sodachat                         # interactive
-.venv/bin/python -m sodachat --once "hey whats up"   # one-shot
+.venv/bin/python -m sodachat                          # agent: chat + games (default)
+.venv/bin/python -m sodachat.cli                       # plain chat, no games
+.venv/bin/python -m sodachat.cli --once "hey whats up" # one-shot
 ```
 
-Flags: `--backend mini|gpt2`, `--plain` (hide reply metadata),
+`sodachat.cli` flags: `--backend mini|gpt2`, `--plain` (hide reply metadata),
 `--unfiltered`, `--seed N`.
 
 ## Discord
@@ -254,10 +255,11 @@ out; head-on, the longer snake lives; last snake standing wins.
 ### One agent: chat and play together
 
 `sodachat.agent` is a single interface that routes each message — an intent to
-play starts a game, everything else is chat:
+play starts a game, everything else is chat. It's what `python -m sodachat`
+runs by default:
 
 ```sh
-.venv/bin/python -m sodachat.agent
+.venv/bin/python -m sodachat
 ```
 
 ```
@@ -428,13 +430,14 @@ game ([games/sandbox.py](sodachat/games/sandbox.py)) is a bare movement grid (on
 agent, one target) that exists purely to probe VLA transfer. The model *never
 trains on it*, but its moves (`up/down/left/right`) and goals ("go to the top
 left corner", "eat the food") are the ones it learned on Snake, and the board
-uses Snake's glyphs — so a goal-conditioned model obeys instructions on it
-zero-shot. `expert vla` measures the follow-rate; you can also `/play sandbox`
-in the agent and steer it live with `/goal`. Measured on the final model:
-directional goals ~83%, corner goals 100%, target goals 100% — instruction-
-following that generalizes to a game outside the training set.
+uses the same `model_board()` glyphs (agent `@`, target `*` — Snake's head and
+food) — so a goal-conditioned model obeys instructions on it zero-shot. `expert
+vla` measures the follow-rate; you can also `/play sandbox` in the agent and
+steer it live with `/goal`. Measured on the final model: directional goals
+100%, corner goals 100%, target goals ~67% — instruction-following that
+generalizes to a game outside the training set.
 
-### Specialists the expert can load (image recognition as a plug-in)
+### Specialists the expert can load (new capabilities as plug-ins)
 
 The task-routed split enables one more trick: **new capabilities as plug-in
 experts**. A *specialist* is a fresh FFN expert per block plus its own output
@@ -490,6 +493,46 @@ the same base attach in the order they were trained; a specialist also
 records a fingerprint of the trunk it was trained against, so a stale one
 fails to load with a clear message instead of silently misfiring.
 
+### A second specialist: code (language ID + completion)
+
+The same plug-in mechanism adds a **code** specialist
+([code.py](sodachat/code.py)): a fresh expert + head, trained with the trunk
+frozen, that (1) names a snippet's programming language and (2) continues it.
+The corpus is [CodeSearchNet](https://huggingface.co/datasets/code_search_net)
+— function bodies across six languages (python, java, javascript, php, ruby,
+go), subsampled to a few thousand each. A snippet becomes a tagged doc the
+same way an image does:
+
+```
+<|code|>
+def hello(name):
+    return f"hi {name}"
+<|cls|>
+```
+
+The language reads off a 6-way class head at the trailing `<|cls|>` in a
+single forward pass — same mechanism as the vision label and the game move.
+The completion path is different: it reuses the *shared, frozen* LM head
+(tied to the embeddings) and generates token by token with every token routed
+to the code expert. So classification is what this specialist actually learns
+(and it learns it well — expect high accuracy, like vision's digits), while
+completion is bounded by what the pretrained text trunk already knows. Treat
+continuations as autocomplete-flavoured, not a real code model — a ~14M trunk
+frozen at its dialogue diet can only do so much with source code.
+
+```sh
+python -m sodachat.code train    # needs models/expert.pt; trunk stays frozen
+python -m sodachat.code eval     # held-out accuracy, per language
+python -m sodachat.code demo     # print a few snippets + predicted language
+python -m sodachat.code complete --file snippet.py
+```
+
+Once trained, the expert loads it automatically — it shows up under the
+expert in `/model`, and dropping a source file into the chat (or
+`/code <file>`) names its language. Add `complete` (`/code <file> complete`)
+and it continues the file; a plain-text follow-up like *"what language was
+that?"* is answered from what it read — the same pattern as `/see`.
+
 ### Consistent latency (why real-time control works)
 
 For real-time control, *worst-case* latency matters more than the average — a
@@ -527,11 +570,27 @@ priority pinning or an RTOS, which is out of scope for a terminal game.
 
 **Adding your own game** is one file: subclass `Game`, set `MODALITY`
 (`"grid"` or `"text"`), the action list, and implement `reset` / `observe` /
-`step` plus a scripted `expert` for the training data. Decorate it with
+`step` plus a scripted `expert` for the training data. A grid game also sets
+`GLYPHS` (pretty Unicode for the terminal) and `MODEL_GLYPHS` (one ASCII byte
+per cell value for the board the LM reads — `.` empty, `@` the thing you
+control, `#` an obstacle, `*` the objective; see below). Decorate it with
 `@register` and it's immediately trainable, playable, and available in the
 agent — nothing in the tokenizer, trainer, or UI is game-specific. See
 [games/snake.py](sodachat/games/snake.py) (grid) and
 [games/tictactoe.py](sodachat/games/tictactoe.py) (text) for the two patterns.
+
+**A board for the eye and a board for the model.** The terminal board
+(`render()`, `GLYPHS`) uses box-drawing/block glyphs that look good but cost
+2–3 bytes each — a 20×20 board tokenizes to ~800 subwords, which overflowed the
+expert's context and truncated the goal header right off the front, and it drew
+snake's head and body with the *same* glyph (they differed only by colour,
+which the text board drops), so the LM couldn't even see where its head was. So
+the LM movers read `model_board()` instead: one ASCII byte per cell
+(`MODEL_GLYPHS`), ~100 tokens for a 20×20 board, every value distinct. The
+convention (`@` controlled entity, `*` objective) is shared across games, so
+snake's `@`/`*` and the sandbox probe's `@`/`*` line up and instruction-
+following transfers. The specialist per-game models are unaffected — they
+encode cell *values* directly (one token per cell, the table above).
 
 ## Layout
 
@@ -554,6 +613,8 @@ sodachat/
   expert.py       # task-routed experts: 1 model, separate game/chat FFNs -> models/expert.pt
   vision.py       # image-recognition specialist (MNIST digits + CIFAR-10 objects),
                   #   a frozen-trunk expert add-on -> models/specialist-vision.pt
+  code.py         # code specialist (language ID + completion), CodeSearchNet,
+                  #   a frozen-trunk expert add-on -> models/specialist-code.pt
   narrate.py      # multi-head model (MultiHeadGPT): action head + LM commentary in one pass
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/

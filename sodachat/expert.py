@@ -259,31 +259,41 @@ class ExpertGPT(nn.Module):
         if abs(self._trunk_sig() - ck["trunk_sig"]) > 1e-2:
             raise ValueError(f"specialist {name!r} was trained against a different "
                              f"expert checkpoint — retrain it against this one")
-        # 1) vocabulary: re-add the specialist's special tokens. Ids must land
-        # where they were at training time (they index the embedding), so
-        # specialists trained from the same base must attach in training order.
+        # 1) vocabulary: re-add the specialist's special tokens and restore their
+        # trained embedding rows. A token's id need not match training time: two
+        # specialists trained from the same base each grabbed the first free slot
+        # for their private tag (e.g. both <|img|> and <|code|> were id 10001),
+        # so we key by the token string and write each trained row at wherever
+        # the token resolves *now*. The embedding follows its token, so attach
+        # order no longer has to match training order. A marker token shared with
+        # an already-attached specialist (e.g. <|cls|>) keeps the embedding that
+        # specialist installed rather than being overwritten by this one's.
         token_ids = ck["token_ids"]
+        before = len(tok)
         tok.add_special(list(token_ids))
-        for t, want in token_ids.items():
-            if tok.token_id(t) != want:
-                raise ValueError(f"token {t!r} resolved to id {tok.token_id(t)}, "
-                                 f"trained as {want} — attach specialists in the "
-                                 f"order they were trained")
         if len(tok) > self.cfg.vocab_size:
             self.grow_vocab(len(tok))
         with torch.no_grad():
-            for t, i in token_ids.items():
+            for t in token_ids:
+                i = tok.token_id(t)
+                if i < before:  # a shared marker an earlier specialist owns
+                    continue
                 self.tok_emb.weight[i] = ck["emb_rows"][t].to(self.tok_emb.weight.device)
-        # 2) a fresh expert slot + the head, then load the trained weights
+        # 2) a fresh expert slot, plus a head for a classifier (a generator has
+        # none — it decodes through the shared, frozen LM head), then load the
+        # trained weights, remapping the expert onto its new slot.
         task = self.add_expert()
-        head_w = ck["state_dict"][f"heads.{name}.weight"]
-        self.heads[name] = nn.Linear(self.cfg.n_embd, head_w.shape[0]).to(
-            self.tok_emb.weight.device)
+        head_key = f"heads.{name}.weight"
+        if head_key in ck["state_dict"]:
+            head_w = ck["state_dict"][head_key]
+            self.heads[name] = nn.Linear(self.cfg.n_embd, head_w.shape[0]).to(
+                self.tok_emb.weight.device)
         src = {k.replace(f".experts.{ck['task_trained']}.", f".experts.{task}."): v
                for k, v in ck["state_dict"].items()}
         result = self.load_state_dict(src, strict=False)
         assert not result.unexpected_keys, result.unexpected_keys
-        self.specialists[name] = {"task": task, "labels": ck["labels"],
+        self.specialists[name] = {"task": task, "labels": ck.get("labels", []),
+                                  "kind": ck.get("kind", "classify"),
                                   **ck.get("meta", {})}
         return task
 
@@ -389,7 +399,7 @@ def _game_docs(n_per_game: int, n_snake_instruct: int, seed: int):
             while not g.done and made < n_per_game:
                 action = g.expert()
                 goal = rng.choice(_DEFAULT_GOALS.get(name, ["play well"]))
-                yield _play_doc(name, g.render(), goal), GAME, ACTION_ID[action]
+                yield _play_doc(name, g.model_board(), goal), GAME, ACTION_ID[action]
                 made += 1
                 nxt = (rng.choice(g.safe_actions() or [action])
                        if rng.random() < 0.15 else action)
@@ -407,7 +417,7 @@ def _game_docs(n_per_game: int, n_snake_instruct: int, seed: int):
             fn, phrasings = goals[rng.choice(list(goals))]
             action = fn()
             if action in ACTION_ID:
-                yield (_play_doc("snake", g.render(), rng.choice(phrasings)),
+                yield (_play_doc("snake", g.model_board(), rng.choice(phrasings)),
                        GAME, ACTION_ID[action])
                 made += 1
             g.step(g.expert() if rng.random() > 0.15
@@ -538,7 +548,7 @@ def _validate(model, data, block, device, lam, iters=40):
 
 
 def train(base=BASE_PATH, out=DEFAULT_PATH, steps=8000, batch_size=24, lr=2e-4,
-          lam=1.0, block_size=640, n_per_game=50_000, n_snake_instruct=100_000,
+          lam=1.0, block_size=1024, n_per_game=50_000, n_snake_instruct=100_000,
           n_chat=250_000, n_read=100_000, device=None, seed=1337, log=print) -> Path:
     """Warm-start ExpertGPT from the dense unified model and train with two
     objectives: LM loss on every token (routed to its task's expert) and action
@@ -547,8 +557,10 @@ def train(base=BASE_PATH, out=DEFAULT_PATH, steps=8000, batch_size=24, lr=2e-4,
     play no longer dislodges its chat ability.
 
     block_size is raised well above unified's window (RoPE has no learned position
-    params, so warm-start is unaffected) because the 20x20 boards render to
-    hundreds of tokens and would otherwise be truncated mid-board."""
+    params, so warm-start is unaffected) to give chat/read long context and leave
+    generous headroom for game docs. Boards are now the compact `model_board()`
+    ASCII (~100 tokens for 20x20, vs ~800 for the human `render()` — which
+    overflowed even this window and truncated the goal header off the front)."""
     device = device or pick_device()
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -645,16 +657,26 @@ def load(path=DEFAULT_PATH, device=None):
 
 
 def scaffold_specialist(base=DEFAULT_PATH, *, name: str, special_tokens: list[str],
-                        n_labels: int, seed_from: int = GAME, device=None):
-    """Load the trained expert model and bolt on an empty specialist: the new
-    special tokens (fresh embedding rows), a new FFN expert per block (seeded
+                        n_labels: int | None = None, seed_from: int = GAME,
+                        device=None):
+    """Load the trained expert model and bolt on an empty specialist: any new
+    special tokens (fresh embedding rows) and a new FFN expert per block (seeded
     from an existing expert — GAME by default, since its glyph-grid diet is the
-    closest thing to most new modalities), and an `n_labels`-way head.
+    closest thing to most new modalities; pass TEXT for a generator that decodes
+    natural language / code through the LM head).
+
+    A specialist is one of two shapes:
+      * classifier — pass `n_labels`: an `n_labels`-way head reads a label off
+        the final token (vision, code language-ID).
+      * generator — leave `n_labels` None: no head. The expert is trained on the
+        shared, frozen LM head (next-token loss) and produces text with
+        `generate_text`. Give it no special tokens and it needs no vocabulary
+        growth at all (codegen).
 
     Everything shared is frozen, so specialist training cannot disturb chat,
-    reading, or play: only the new expert, the head, and the new tokens'
-    embedding rows receive gradients (old embedding rows are pinned by a
-    gradient mask — the embedding is one tensor, tied to the LM head).
+    reading, or play: only the new expert, the head (if any), and any new tokens'
+    embedding rows receive gradients (old embedding rows are pinned by a gradient
+    mask — the embedding is one tensor, tied to the LM head).
 
     Returns (model, tok, task_id)."""
     device = device or pick_device()
@@ -663,19 +685,22 @@ def scaffold_specialist(base=DEFAULT_PATH, *, name: str, special_tokens: list[st
     new_v = tok.add_special(special_tokens)
     model.grow_vocab(new_v)
     task = model.add_expert(seed_from)
-    model.heads[name] = nn.Linear(model.cfg.n_embd, n_labels).to(device)
+    if n_labels:
+        model.heads[name] = nn.Linear(model.cfg.n_embd, n_labels).to(device)
     for p in model.parameters():
         p.requires_grad_(False)
     for block in model.blocks:
         for p in block.ffn.experts[task].parameters():
             p.requires_grad_(True)
-    for p in model.heads[name].parameters():
-        p.requires_grad_(True)
-    w = model.tok_emb.weight
-    w.requires_grad_(True)
-    mask = torch.zeros(new_v, 1, device=device)
-    mask[old_v:] = 1.0
-    w.register_hook(lambda g: g * mask)
+    if n_labels:
+        for p in model.heads[name].parameters():
+            p.requires_grad_(True)
+    if new_v > old_v:  # only the new tokens' rows train; nothing to unfreeze else
+        w = model.tok_emb.weight
+        w.requires_grad_(True)
+        mask = torch.zeros(new_v, 1, device=device)
+        mask[old_v:] = 1.0
+        w.register_hook(lambda g: g * mask)
     return model, tok, task
 
 
@@ -687,17 +712,21 @@ def specialist_param_groups(model: ExpertGPT, weight_decay: float = 0.05) -> lis
     vocabulary the specialist trains against."""
     emb = model.tok_emb.weight
     rest = [p for p in model.parameters() if p.requires_grad and p is not emb]
-    return [{"params": rest, "weight_decay": weight_decay},
-            {"params": [emb], "weight_decay": 0.0}]
+    groups = [{"params": rest, "weight_decay": weight_decay}]
+    if emb.requires_grad:  # a generator with no new tokens leaves it frozen
+        groups.append({"params": [emb], "weight_decay": 0.0})
+    return groups
 
 
 def save_specialist(path, model: ExpertGPT, tok, *, name: str, task: int,
                     labels: list[str], special_tokens: list[str],
-                    steps: int, val_acc: float, meta: dict | None = None) -> None:
+                    steps: int, val_acc: float, kind: str = "classify",
+                    meta: dict | None = None) -> None:
     """Persist just the specialist's parameters: its per-block FFN expert, its
-    head, and the embedding rows of its special tokens — keyed exactly as they
-    will live in the grafted model, so `attach_specialist` is a partial
-    state-dict load."""
+    head (classifiers only), and the embedding rows of any special tokens —
+    keyed exactly as they will live in the grafted model, so `attach_specialist`
+    is a partial state-dict load. `kind` is "classify" or "generate"; a
+    generator has no head and typically no special tokens."""
     sd = model.state_dict()
     keep = {k: v.detach().cpu().clone() for k, v in sd.items()
             if f".experts.{task}." in k or k.startswith(f"heads.{name}.")}
@@ -707,6 +736,7 @@ def save_specialist(path, model: ExpertGPT, tok, *, name: str, task: int,
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "specialist": name,
+        "kind": kind,
         "config": asdict(model.cfg),
         "state_dict": keep,
         "task_trained": task,
@@ -891,7 +921,7 @@ def vla_probe(path=DEFAULT_PATH, trials=15, device="cpu", seed=0, log=print) -> 
         g = SandboxGame(seed=1000 + t)
         g.ar, g.ac = 3 + (t % 4), 3 + ((t * 3) % 4)  # interior, deterministic
         g._respawn_target()
-        pos, tgt, legal, board = (g.ar, g.ac), (g.tr, g.tc), list(g.ACTIONS), g.render()
+        pos, tgt, legal, board = (g.ar, g.ac), (g.tr, g.tc), list(g.ACTIONS), g.model_board()
 
         for d in ("up", "down", "left", "right"):
             dir_hit += lm.move("sandbox", board, legal, goal=f"go {d}") == d
@@ -924,7 +954,7 @@ def _eval_cli(game_name: str, episodes: int) -> None:
         g = cls(seed=1000 + ep)
         while not g.done:
             legal = [a for a in g.ACTIONS if g.legal(a)]
-            g.step(lm.move(game_name, g.render(), legal))
+            g.step(lm.move(game_name, g.model_board(), legal))
         scores.append(getattr(g, "score", 0))
     print(f"{game_name}: mean score {sum(scores) / len(scores):.2f} over {episodes} episodes")
 

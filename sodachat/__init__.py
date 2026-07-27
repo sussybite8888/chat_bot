@@ -21,6 +21,7 @@ Each model = an architecture + its data/training/inference, in one file:
     instruct      instruct.py   MiniGPT          InstructPlayer    unified-instruct.pt
     expert        expert.py     ExpertGPT        ExpertLM          expert.pt
     vision        vision.py     (expert add-on)  via ExpertLM      specialist-vision.pt
+    code          code.py       (expert add-on)  via ExpertLM      specialist-code.pt
 
 Architectures:
     MiniGPT       (model.py)   base decoder LM — chat, reader, games, unified, instruct

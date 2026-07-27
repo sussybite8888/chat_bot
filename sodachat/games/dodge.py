@@ -26,6 +26,8 @@ class DodgeGame(Game):
         AGENT: ("▲", "bright_green"),
         WALL: ("█", "red"),
     }
+    # agent '@' (the controlled entity), wall '#' (the obstacle to avoid).
+    MODEL_GLYPHS = {EMPTY: ".", AGENT: "@", WALL: "#"}
 
     def reset(self) -> "DodgeGame":
         self.col = self.cols // 2

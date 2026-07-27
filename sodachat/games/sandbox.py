@@ -46,6 +46,9 @@ class SandboxGame(Game):
         AGENT: ("█", "bright_green"),
         TARGET: ("●", "yellow"),
     }
+    # agent '@', target '*' — the same pair snake uses (head/food), so a model
+    # trained on snake follows "go to the target" here zero-shot (the VLA probe).
+    MODEL_GLYPHS = {EMPTY: ".", AGENT: "@", TARGET: "*"}
 
     def reset(self) -> "SandboxGame":
         self.ar, self.ac = self.rng.randrange(self.rows), self.rng.randrange(self.cols)
