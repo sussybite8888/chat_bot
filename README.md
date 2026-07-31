@@ -533,6 +533,158 @@ expert in `/model`, and dropping a source file into the chat (or
 and it continues the file; a plain-text follow-up like *"what language was
 that?"* is answered from what it read — the same pattern as `/see`.
 
+### A reasoning specialist: thinking step by step
+
+Every specialist so far answers in one shot. The **reasoning** specialist
+([reason.py](sodachat/reason.py)) is the first one trained to *show its work* —
+given a question it writes the intermediate steps, then commits to an answer:
+
+```
+<|reason|> Natalia sold clips to 48 of her friends in April, and then she sold
+half as many clips in May. How many clips did Natalia sell altogether?
+<|think|> Natalia sold 48/2 = 24 clips in May.
+Natalia sold 48+24 = 72 clips altogether in April and May.
+<|answer|> 72 <|end|>
+```
+
+Same plug-in shape as the others — one fresh FFN expert per block, trunk frozen,
+three new tag tokens — but with three differences that matter:
+
+**Prompt-masked loss.** The question is context, not a prediction target, so the
+loss is taken only over the `<|think|>`/`<|answer|>` span. The corpus therefore
+ships as *two* parallel binaries, token ids and a per-token supervision mask —
+the same trick [expert.py](sodachat/expert.py) uses to carry task ids and action
+targets alongside the tokens. Train on the question too (what a plain packed LM
+stream does) and most of the gradient goes into learning to write questions.
+
+**An answer *token*.** `<|answer|>` is a token, not a phrase, so the final answer
+is recovered by splitting on token ids rather than by parsing prose — which
+matters because the tokenizer drops special tokens when it decodes, and because
+at this scale the reasoning often wanders before it lands.
+
+**A much larger corpus.** The earlier specialists each trained on one dataset of
+a few thousand examples (MNIST, CIFAR-10, ~24k CodeSearchNet snippets). Reasoning
+doesn't survive that diet — step-by-step derivation has to be seen in bulk and in
+many phrasings. So the corpus is streamed and interleaved from **eight public
+datasets**, all permissively licensed:
+
+| dataset | license | rows | what it adds |
+|---|---|---|---|
+| [OpenMathInstruct-2](https://huggingface.co/datasets/nvidia/OpenMathInstruct-2) | CC-BY-4.0 | 22M | the bulk: plain step-by-step prose with the answer in its own field |
+| [GSM8K](https://huggingface.co/datasets/openai/gsm8k) (`main` + `socratic`) | MIT | 7.5k×2 | gold grade-school word problems, in plain and self-questioning style |
+| [MetaMathQA](https://huggingface.co/datasets/meta-math/MetaMathQA) | MIT | 395k | bulk short step-by-step math |
+| [MathInstruct](https://huggingface.co/datasets/TIGER-Lab/MathInstruct) (CoT only) | MIT | 262k | terse multi-choice chains |
+| [orca-math-word-problems](https://huggingface.co/datasets/microsoft/orca-math-word-problems-200k) | MIT | 200k | conversational worked solutions |
+| [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) | Apache-2.0 | 860k | competition math, `\boxed{}` answers |
+| [AQuA-RAT](https://huggingface.co/datasets/deepmind/aqua_rat) | Apache-2.0 | 97k | quantitative multiple choice with rationales |
+| [StrategyQA](https://huggingface.co/datasets/ChilleD/StrategyQA) | MIT | 1.6k | non-arithmetic implicit multi-hop yes/no |
+
+That builds to **~1.6M reasoning traces / 400M tokens** — three orders of magnitude
+more examples than any earlier specialist. Sources are read with `streaming=True`
+and tokenized straight into the cached `.bin` stream, so the corpus costs ~1.2 GB
+on disk where the raw parquet would be over 12 GB, and never lands on the training
+box whole.
+
+The size is chosen to match the **training schedule**, not to be as large as
+possible: the default run sees 20k × 24 × 512 = 246M tokens, so a 400M-token corpus
+means each example is seen ~0.6 times and the model never gets to memorize one.
+These sources could supply billions of tokens; the rest would simply never be read.
+
+**What was measured and rejected**, so nobody re-litigates it — every one of these
+looked good on its dataset card:
+
+| rejected | why |
+|---|---|
+| [OpenMathInstruct-1](https://huggingface.co/datasets/nvidia/OpenMathInstruct-1) (6.9M) | solutions are `<llm-code>` Python blocks. A 97% keep-rate that is really 97% code — `codegen`'s job, and the wrong output shape here |
+| [NuminaMath-1.5](https://huggingface.co/datasets/AI-MO/NuminaMath-1.5) (896k) | only 22% survives: olympiad proofs whose `answer` field is the word "proof" |
+| [orca-agentinstruct-1M](https://huggingface.co/datasets/microsoft/orca-agentinstruct-1M-v1) (1M) | the best hope for non-math breadth: keeps **0%** of `analytical_reasoning`, 2–12% elsewhere, and the survivors are quantitative anyway |
+| [CoT-Collection](https://huggingface.co/datasets/kaist-ai/CoT-Collection) (1.8M) | the one set that would have fixed the math skew — script-only, so unloadable under `datasets` 5.x, with no parquet mirror |
+| [OpenMathReasoning](https://huggingface.co/datasets/nvidia/OpenMathReasoning) (3.2M) | R1 traces average ~20k characters against this window's ~1.2k |
+| camel-ai/math, facebook/natural_reasoning | non-commercial licenses |
+
+So the mix is **~99.9% quantitative**. StrategyQA is the only non-arithmetic source
+that is both permissively licensed and loadable, and it has 1,603 usable rows. In
+practice this is a *quantitative* reasoner — ask it a general-knowledge yes/no
+question and you get confident nonsense, because nothing in its diet looks like
+that. Fixing it needs a large non-math CoT corpus that doesn't currently exist in
+loadable, permissive form, not a reweighting of this one.
+
+```sh
+python -m sodachat.reason data     # build/inspect the corpus cache only
+python -m sodachat.reason train    # needs models/expert.pt; trunk stays frozen
+python -m sodachat.reason eval     # held-out perplexity + GSM8K exact match
+python -m sodachat.reason demo     # a few questions + chains of thought
+python -m sodachat.reason think --question "..."
+```
+
+**The held-out split is keyed on problem *identity*, not question text.** A 1-in-40
+hash of the question would look disjoint and still leak badly here: MetaMathQA
+augments each source problem into many rephrasings, and ~89k of MathInstruct's CoT
+rows are AQuA-RAT problems that differ only in how the choices are spelled
+(`Options: A)21` vs `Answer Choices: (A) 21`). Either way the *same problem* would
+land in train under one phrasing and in val under another, and the held-out
+perplexity would be quietly scoring memorization. So the split hashes a normalized
+identity — choice list stripped, and MetaMathQA's `original_question` in place of
+its rephrasing — which keeps every variant of a problem on one side.
+
+### Measured: what 4x the data actually bought
+
+Both models scored on the *same* held-out stream, and on the same 200 GSM8K **test**
+problems (never trained on):
+
+| corpus | traces | steps | val ppl | GSM8K exact match |
+|---|---|---|---|---|
+| 100M tokens | 412k | 5,500 | 5.0 | 4/200 = **2.0%** |
+| 400M tokens | 1.42M | 20,000 | **3.5** | 3/200 = **1.5%** |
+
+**Perplexity improved a lot; answer accuracy did not move.** 4 hits versus 3 on the
+same 200 problems is a one-problem difference — noise, not a regression, and not an
+improvement either. Nor can it be resolved by measuring harder: at ~2% accuracy,
+separating 1.5% from 2.0% needs thousands of problems, and GSM8K's test split only
+has 1,319.
+
+The gain is real but it is in *fluency of reasoning*, not correctness. At matched
+compute (step 5500, same val stream) the larger corpus was already ahead, 5.0 → 4.7,
+so some of it is data diversity rather than the extra steps. And the chains genuinely
+got better structured — it now picks the right operations and often computes them
+correctly:
+
+```
+Q: A shirt costs $15 and jeans cost twice as much. How much do both cost?
+   "the jeans cost 2 * 15 = $30. The total for both is $15 + $30 = $45."   ✓ correct
+Q: If a train travels 60 miles in 2 hours, what is its average speed?
+   "the average speed is 60 / 2 = 30 miles per hour"                       ✓ correct
+   answer: "$30 / 30 = 1.5$ miles per hour"        ← mangled a right answer
+Q: 3 boxes of 7 pencils, gives away 5. How many left?
+   "3 * 7 = 21 pencils"                                                    ✓ correct
+   "21 - 5 = 12 pencils left"                      ← right operation, bad arithmetic
+```
+
+Two failure modes remain, and they are what exact-match punishes: arithmetic slips,
+and a spurious *extra operation inside the answer slot* after the right value was
+already derived. The second is a data artifact worth fixing — prose answers still
+reach the corpus from orca-math (~3.5% of it), which teaches the model that reasoning
+may continue past `<|answer|>`.
+
+**The honest conclusion: the binding constraint is the frozen ~14M trunk, not the
+corpus size.** More data made it a better model *of* reasoning text and did not make
+it better at arithmetic. Going from 400M to 4B tokens would be expected to do the
+same again. Getting real accuracy needs a bigger or unfrozen trunk, or a tool the
+model can call to do the arithmetic — not more tokens.
+
+**Read the score honestly.** `eval` reports GSM8K *test* exact-match next to
+perplexity, because perplexity flatters a model like this and accuracy doesn't. The
+table above is why both are printed. The trunk is a ~14M-parameter model frozen on a
+chat/game diet with a dialogue BPE vocabulary: it learns the *shape* of reasoning
+— the format, the moves, the arithmetic patois — far better than it learns to be
+right. Expect fluent-looking derivations with wrong totals.
+
+Once trained, the expert loads it automatically: `/think <question>` works it out
+in the agent, and questions in plain chat that clearly want working-out ("how
+many are left if I have 12 apples and eat 3?") route here on their own. The
+trigger is deliberately conservative — chat is the default, and hijacking small
+talk to "reason" about it reads worse than missing a word problem.
+
 ### Consistent latency (why real-time control works)
 
 For real-time control, *worst-case* latency matters more than the average — a
@@ -615,6 +767,10 @@ sodachat/
                   #   a frozen-trunk expert add-on -> models/specialist-vision.pt
   code.py         # code specialist (language ID + completion), CodeSearchNet,
                   #   a frozen-trunk expert add-on -> models/specialist-code.pt
+  codegen.py      # code-generation specialist (next-token LM over code),
+                  #   a frozen-trunk expert add-on -> models/specialist-codegen.pt
+  reason.py       # reasoning specialist (step-by-step then answer), 7 public CoT
+                  #   datasets -> models/specialist-reason.pt
   narrate.py      # multi-head model (MultiHeadGPT): action head + LM commentary in one pass
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/

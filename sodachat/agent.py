@@ -236,6 +236,12 @@ class SodaAgent:
         # being read as a question about a previously-seen file.
         if (answer := self._code_gen_answer(s)) is not None:
             return answer
+        # A question worth working through ("how many apples are left if ...") →
+        # the reasoning specialist, which shows its steps before answering.
+        # Deliberately ahead of the code Q&A check below, whose trigger list
+        # includes the word "in" and so would otherwise swallow word problems.
+        if (answer := self._reason_answer(s)) is not None:
+            return answer
         if (answer := self._code_answer(s)) is not None:
             return answer
         # plain text → the model. During tic-tac-toe a bare cell is a move I
@@ -654,6 +660,70 @@ class SodaAgent:
         seeded = self._codegen_seed(text)
         return None if seeded is None else self._run_codegen(text, *seeded)
 
+    # ------------------------------------------------------------- reasoning
+    #
+    # A question that wants working-out rather than small talk ("if I have 12
+    # apples and eat 3, how many are left?") goes to the reasoning specialist
+    # (reason.py), which writes its steps and then commits to an answer. The
+    # trigger has to be conservative: chat is the default, and hijacking ordinary
+    # conversation to "reason" about it reads far worse than missing a word
+    # problem.
+
+    def _reason_lm(self):
+        """The ExpertLM hosting the reasoning specialist, for /think and worked
+        questions asked in chat. None if it isn't trained yet."""
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+        from .reason import NAME
+
+        return self._specialist_lm(EXPERT_PATH, NAME)
+
+    # Asking to be shown the work, in so many words — enough on its own.
+    _REASON_VERB = (r"(solve|calculate|compute|work out|figure out|reason|"
+                    r"think through|think step|step by step|explain why|prove)")
+    # Quantity questions: "how many/much", "what is the total/average/..." — the
+    # shapes the corpus is full of.
+    _REASON_ASK = (r"(how (many|much|long|old|far|fast)|what('s| is|s) the "
+                   r"(total|sum|difference|product|average|mean|answer|result|"
+                   r"percentage|remainder))")
+
+    def _reason_request(self, text: str) -> bool:
+        """Whether `text` is a question to be worked through. Requires either an
+        explicit ask to solve/explain, or a quantity question that actually has
+        numbers in it — a bare "how much do you like me?" is chat, not maths."""
+        import re
+
+        low = f" {text.lower()} "
+        if re.search(rf"\b{self._REASON_VERB}\b", low):
+            return True
+        has_numbers = len(re.findall(r"\d", text)) >= 2
+        return bool(has_numbers and re.search(rf"\b{self._REASON_ASK}", low))
+
+    def _run_reason(self, question: str) -> str:
+        lm = self._reason_lm()
+        if lm is None:
+            return ("I'd think that through, but my reasoning specialist isn't "
+                    "trained yet:\n  python -m sodachat.reason train")
+        from .reason import think
+
+        steps, answer = think(lm, question)
+        if not steps and not answer:
+            return "I couldn't get anywhere with that one."
+        # History keeps the question and the conclusion, not the whole
+        # derivation, so the chat model isn't fed a wall of arithmetic.
+        self.history.extend([" ".join(question.split()),
+                             answer or "(no answer reached)"])
+        body = f"thinking: {steps}" if steps else "(no steps)"
+        if answer:
+            body += f"\n\nanswer: {answer}"
+        return (f"{body}\n\n(worked out by a ~14M-parameter model — it imitates "
+                f"reasoning far better than it does arithmetic, so check it.)")
+
+    def _reason_answer(self, text: str) -> str | None:
+        """Work through a question step by step, or None to fall through to the
+        other handlers. This is the main loop 'activating' the reasoning
+        specialist."""
+        return self._run_reason(text) if self._reason_request(text) else None
+
     def _code_answer(self, text: str) -> str | None:
         """A deterministic answer for plain-text questions about the last seen
         source file ("what language was that?"), or None to fall through."""
@@ -757,6 +827,17 @@ class SodaAgent:
                     "'write a js function to debounce a callback'.")
         lang, seed = self._codegen_seed(arg, force=True)
         return self._run_codegen(arg, lang, seed)
+
+    def _cmd_think(self, arg: str) -> str:
+        """Work a question out step by step via the reasoning specialist (see
+        reason.py): `/think if I have 12 apples and eat 3, how many are left?`.
+        In plain chat, questions that clearly want working-out are routed here
+        automatically."""
+        if not arg.strip():
+            return ("Usage: /think <question> — e.g. `/think a shirt costs $15 "
+                    "and jeans cost twice as much, how much for both?`. I'll "
+                    "show my steps, then answer.")
+        return self._run_reason(arg)
 
     def _cmd_duel(self, arg: str) -> str:
         # The live duel takes over the terminal, so the terminal loop runs it
@@ -914,6 +995,9 @@ _COMMANDS = {
     "lang": SodaAgent._cmd_code,
     "gen": SodaAgent._cmd_gen,
     "generate": SodaAgent._cmd_gen,
+    "think": SodaAgent._cmd_think,
+    "reason": SodaAgent._cmd_think,
+    "solve": SodaAgent._cmd_think,
     "model": SodaAgent._cmd_model,
     "info": SodaAgent._cmd_model,
     "goal": SodaAgent._cmd_goal,
@@ -936,6 +1020,8 @@ _HELP = [
      " add `complete` to continue it"),
     ("/gen <description>", "generate code from a description (or just ask in chat:"
      " 'write a python function that ...')"),
+    ("/think <question>", "work a question out step by step, then answer (or just"
+     " ask in chat: 'how many are left if ...')"),
     ("/model", "show models, or switch: expert | specialist | unified | instruct"),
     ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),
