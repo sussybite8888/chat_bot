@@ -181,14 +181,24 @@ class _ExpertPlayer:
 
 
 class SodaAgent:
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", filtered: bool = True,
+                 shared: dict | None = None):
         self.device = device
-        self._chat = None
-        self._reader = None
-        self._lms: dict = {}  # UnifiedLM/ExpertLM cache, keyed by checkpoint path
+        # Handed to every ChatEngine this agent builds, so a frontend's
+        # SODACHAT_UNFILTERED reaches the model that actually replies.
+        self.filtered = filtered
+        # Loaded checkpoints live in `shared`, which several agents can be given
+        # at once. A chat-room frontend runs one agent per room — each needs its
+        # own history, its own game, its own "last image seen" — and must not
+        # load a 190MB checkpoint per room. Everything outside `shared` is
+        # per-agent, i.e. per-conversation.
+        self._shared: dict = {} if shared is None else shared
+        self._lms: dict = self._shared.setdefault("lms", {})
         # ChatEngine wrapping an active LM, so MMI relevance reranking runs in
         # every mode (not just specialist). Keyed by checkpoint path so the
-        # per-engine recent-reply deque persists across mode switches.
+        # per-engine recent-reply deque persists across mode switches. Not
+        # shared: the engine is a thin wrapper (its model comes from `_lms`) and
+        # one room's replies shouldn't suppress another room's.
         self._engines: dict = {}
         # Default to the task-routed expert: one model that chats, reads, plays
         # every game (goal-conditioned), and hosts the vision specialist. Once it
@@ -203,9 +213,9 @@ class SodaAgent:
         self.continuous: ContinuousGame | None = None  # running grid game
         self.game = None  # interactive text game (tic-tac-toe)
         self.player = None
-        self._counter = None  # tokenizer used only to count reply tokens
         self.seen_image: dict | None = None  # what /see (or a dropped image) last saw
         self.seen_code: dict | None = None   # what /code (or a dropped source file) last read
+        self.last_route: tuple[str, str, float] | None = None  # (message, route, conf)
         self.stats = {"replies": 0, "tokens": 0, "seconds": 0.0}
         self.last = {"tokens": 0, "ms": 0.0, "tok_s": 0.0, "hz": 0.0}
 
@@ -219,53 +229,114 @@ class SodaAgent:
             if command is None:
                 return f"Unknown command /{name}. Try /help."
             return command(self, arg.strip())
-        # An image dropped into the chat (its path, quoted or bare) is looked
-        # at right away; plain-text questions that name it ("what's in the
-        # picture?") are answered from what was seen — the same pattern as the
-        # reader answering questions about the live game state.
+        # A file dropped into the chat is handled by what it *is* rather than by
+        # what the message says about it: an image is looked at, a source file is
+        # read. That's a fact about the message, not a judgement, so it stays
+        # ahead of the router.
         if (img := self._find_image_path(s)) is not None:
             return self._look_at(img, s)
-        if (answer := self._image_answer(s)) is not None:
-            return answer
-        # A source file dropped into the chat is read by the code specialist —
-        # it names the language (and can continue it). Same pattern as /see.
         if (code := self._find_code_path(s)) is not None:
             return self._read_code(code, s)
-        # "write a function that ..." → the code-generation specialist. Checked
-        # before code Q&A so "can you write code that ...?" generates rather than
-        # being read as a question about a previously-seen file.
-        if (answer := self._code_gen_answer(s)) is not None:
+        # Mid tic-tac-toe a bare cell is a move, and a move is not a message to
+        # classify.
+        if (moved := self._move_if_legal(s)) is not None:
+            return moved
+        # Everything else is a judgement call, and the routing specialist makes
+        # it (route.py): one forward pass, six destinations. Below its confidence
+        # threshold it answers "chat", and the hand-written triggers get a second
+        # look — they are also the whole story until the specialist is trained.
+        label, _ = self._route(s)
+        if (answer := self._dispatch(label, s)) is not None:
             return answer
-        # A question worth working through ("how many apples are left if ...") →
-        # the reasoning specialist, which shows its steps before answering.
-        # Deliberately ahead of the code Q&A check below, whose trigger list
-        # includes the word "in" and so would otherwise swallow word problems.
-        if (answer := self._reason_answer(s)) is not None:
+        if (answer := self._triggered(s)) is not None:
             return answer
-        if (answer := self._code_answer(s)) is not None:
-            return answer
-        # plain text → the model. During tic-tac-toe a bare cell is a move I
-        # reply to; a legal move goes to the game, other text is read against
-        # the state. With a grid game running, questions read the live state.
-        if self.game is not None:
-            legal = [a for a in self.game.ACTIONS if self.game.legal(a)]
-            if s in legal:
-                return self._text_move(s)
-            if s.isdigit():
-                return f"Cell {s} isn't open. Try one of: {', '.join(legal)}."
-            return self._read(text)
-        if self.continuous is not None:
+        # plain text → the model. With a game running, what's left reads against
+        # the live state (the reader falls back to chat when it has nothing).
+        if self.game is not None or self.continuous is not None:
             return self._read(text)
         return self._chat_reply(text)
+
+    def _move_if_legal(self, s: str) -> str | None:
+        """A tic-tac-toe move typed as a bare cell number, played as a move."""
+        if self.game is None:
+            return None
+        legal = [a for a in self.game.ACTIONS if self.game.legal(a)]
+        if s in legal:
+            return self._text_move(s)
+        if s.isdigit():
+            return f"Cell {s} isn't open. Try one of: {', '.join(legal)}."
+        return None
+
+    # Routing itself is a specialist (route.py): a 6-way classifier over the
+    # destinations below, trained on the frozen trunk like every other one. It
+    # replaces a cascade of regexes whose *order* was doing real work — the
+    # reasoning trigger had to sit ahead of the code-Q&A trigger, whose word list
+    # contains "in" and so swallowed word problems. Those triggers survive as
+    # `_triggered`: the fallback when the specialist isn't trained, and a second
+    # look when it isn't confident.
+
+    def _router_lm(self):
+        """The ExpertLM hosting the routing specialist. None if it isn't trained
+        — in which case the agent routes exactly as it did before it existed."""
+        from .expert import DEFAULT_PATH as EXPERT_PATH
+        from .route import NAME
+
+        return self._specialist_lm(EXPERT_PATH, NAME)
+
+    def _route(self, text: str) -> tuple[str, float]:
+        """Where `text` should go, per the routing specialist, with the
+        confidence behind it. ("chat", 0.0) when the specialist isn't trained,
+        and "chat" whenever it isn't sure enough to leave chat: answering small
+        talk with generated code is a worse failure than missing a request."""
+        lm = self._router_lm()
+        if lm is None:
+            return "chat", 0.0
+        from .route import pick
+
+        label, conf = pick(lm, text)
+        self.last_route = (text, label, conf)
+        return label, conf
+
+    def _dispatch(self, label: str, text: str) -> str | None:
+        """Hand a message to the destination the router picked, or None to fall
+        through — chat, and any route with nothing to say yet."""
+        if label == "codegen":
+            # The router has already decided this asks for code, so the seed is
+            # forced rather than re-derived from the trigger words.
+            return self._run_codegen(text, *self._codegen_seed(text, force=True))
+        if label == "reason":
+            return self._run_reason(text)
+        if label == "vision":
+            # With nothing seen yet, nudge only if the message really is about an
+            # image (i.e. the trigger agrees). A misroute shouldn't answer small
+            # talk with "drop me an image".
+            return (self._seen_image_answer(text) if self.seen_image is not None
+                    else self._image_answer(text))
+        if label == "code":
+            return (self._seen_code_answer(text) if self.seen_code is not None
+                    else self._code_answer(text))
+        if label == "game" and (self.game is not None or self.continuous is not None):
+            return self._read(text)
+        return None
+
+    def _triggered(self, text: str) -> str | None:
+        """The hand-written triggers, in their original precedence."""
+        for trigger in (self._image_answer, self._code_gen_answer,
+                        self._reason_answer, self._code_answer):
+            if (answer := trigger(text)) is not None:
+                return answer
+        return None
 
     # ----------------------------------------------------------------- chat
 
     def _chat_engine(self):
-        if self._chat is None:
+        """The standalone chat model, used in specialist mode. Shared between
+        agents, because unlike `_engine_for` this one loads its own model."""
+        if self._shared.get("chat") is None:
             from .engine import ChatEngine
 
-            self._chat = ChatEngine()
-        return self._chat
+            self._shared["chat"] = ChatEngine(filtered=self.filtered)
+        return self._shared["chat"]
 
     def _engine_for(self, lm) -> "ChatEngine":
         """Wrap an active LM (ExpertLM/UnifiedLM) in a ChatEngine so its chat
@@ -275,7 +346,7 @@ class SodaAgent:
         path = self._mode_path()
         key = str(path) if path is not None else id(lm)
         if key not in self._engines:
-            self._engines[key] = ChatEngine(lm=lm)
+            self._engines[key] = ChatEngine(lm=lm, filtered=self.filtered)
         return self._engines[key]
 
     def _mode_path(self, mode: str | None = None):
@@ -432,11 +503,11 @@ class SodaAgent:
         fields = _facts_to_fields(facts)
         if (lm := self._active_lm()) is not None:  # unified or instruct mode
             return lm.read(fields, text) or self._chat_reply(text)
-        if self._reader is None:
+        if self._shared.get("reader") is None:
             from .reader import Reader
 
-            self._reader = Reader()
-        return self._reader.answer(fields, text) or self._chat_reply(text)
+            self._shared["reader"] = Reader()
+        return self._shared["reader"].answer(fields, text) or self._chat_reply(text)
 
     # ------------------------------------------------------- image understanding
 
@@ -507,8 +578,10 @@ class SodaAgent:
         return f"{render_image(px)}\n\n{sentence}"
 
     def _image_answer(self, text: str) -> str | None:
-        """A deterministic answer for plain-text questions about the last seen
-        image ("what's in the picture?"), or None to fall through to chat."""
+        """The hand-written trigger for questions about the last seen image
+        ("what's in the picture?"), or None to fall through to chat. The routing
+        specialist calls `_seen_image_answer` directly; this is the word-list
+        version it replaces."""
         import re
 
         low = text.lower()
@@ -517,6 +590,10 @@ class SodaAgent:
         if "?" not in text and not re.search(
                 r"\b(what|which|tell|guess|know|recognize|see|saw|seen|think)\b", low):
             return None
+        return self._seen_image_answer(text)
+
+    def _seen_image_answer(self, text: str) -> str:
+        """Answer from the image last looked at — the `vision` route's handler."""
         if self.seen_image is None:
             return ("I haven't seen an image yet — drop one into the chat "
                     "(or /see <file>) and I'll take a look.")
@@ -648,7 +725,7 @@ class SodaAgent:
                     "trained yet:\n  python -m sodachat.codegen train")
         from .codegen import generate
 
-        code = (seed + generate(lm, seed, max_new_tokens=160)).rstrip()
+        code = (seed + generate(lm, seed, max_new_tokens=160, lang=lang)).rstrip()
         # History keeps the words, not the code block, so chat stays coherent.
         self.history.extend([" ".join(echo.split()), f"(generated {lang} code)"])
         return (f"Here's some {lang} — generated by a small model, so read it "
@@ -725,8 +802,10 @@ class SodaAgent:
         return self._run_reason(text) if self._reason_request(text) else None
 
     def _code_answer(self, text: str) -> str | None:
-        """A deterministic answer for plain-text questions about the last seen
-        source file ("what language was that?"), or None to fall through."""
+        """The hand-written trigger for questions about the last seen source file
+        ("what language was that?"), or None to fall through. Its word list
+        contains "in", which is why it had to be tried last of all — the kind of
+        ordering constraint the routing specialist exists to remove."""
         import re
 
         low = text.lower()
@@ -735,6 +814,10 @@ class SodaAgent:
         if "?" not in text and not re.search(
                 r"\b(what|which|tell|guess|know|recognize|see|saw|seen|think)\b", low):
             return None
+        return self._seen_code_answer(text)
+
+    def _seen_code_answer(self, text: str) -> str:
+        """Answer from the file last read — the `code` route's handler."""
         if self.seen_code is None:
             return ("I haven't read any code yet — drop a source file into the "
                     "chat (or /code <file>) and I'll name its language.")
@@ -839,6 +922,30 @@ class SodaAgent:
                     "show my steps, then answer.")
         return self._run_reason(arg)
 
+    def _cmd_route(self, arg: str) -> str:
+        """Show where a message goes and how sure the router is:
+        `/route what language was that?`. With no argument, how the last message
+        went — the quickest way to see why a reply came from where it did."""
+        lm = self._router_lm()
+        if lm is None:
+            return ("My routing specialist isn't trained yet, so I'm routing with "
+                    "the hand-written triggers:\n  python -m sodachat.route train")
+        if not arg.strip():
+            if self.last_route is None:
+                return "Nothing routed yet — say something, or /route <message>."
+            text, label, conf = self.last_route
+            return f"last message {text!r} -> {label} ({conf:.0%})"
+        from .route import MIN_CONF, scores
+
+        dist = scores(lm, arg)
+        label, conf = max(dist.items(), key=lambda kv: kv[1])
+        head = f"{arg!r} -> {label if conf >= MIN_CONF else 'chat'}"
+        if conf < MIN_CONF:
+            head += (f" (best guess {label} at {conf:.0%}, under the "
+                     f"{MIN_CONF:.0%} threshold to leave chat)")
+        rows = sorted(dist.items(), key=lambda kv: -kv[1])
+        return "\n".join([head] + [f"  {name:8} {p:6.1%}" for name, p in rows])
+
     def _cmd_duel(self, arg: str) -> str:
         # The live duel takes over the terminal, so the terminal loop runs it
         # (like /watch). Reached here only from non-terminal frontends.
@@ -849,14 +956,14 @@ class SodaAgent:
     # ------------------------------------------------------------- stats
 
     def _count_tokens(self, text: str) -> int:
-        if self._counter is None:
+        if self._shared.get("counter") is None:
             import torch
 
             from .model import DEFAULT_MODEL_PATH, tokenizer_from_payload
 
             ck = torch.load(DEFAULT_MODEL_PATH, map_location="cpu", weights_only=True)
-            self._counter = tokenizer_from_payload(ck["tokenizer"])
-        return max(1, len(self._counter.encode(text)))
+            self._shared["counter"] = tokenizer_from_payload(ck["tokenizer"])
+        return max(1, len(self._shared["counter"].encode(text)))
 
     def record(self, reply: str, seconds: float) -> None:
         """Log the timing of one model reply (called by the terminal loop)."""
@@ -957,8 +1064,8 @@ class SodaAgent:
             loaded = (EXPERT_PATH in self._lms
                       and name in getattr(self._lms[EXPERT_PATH], "specialists", {}))
             row(f"└ {name} specialist", spec, loaded)
-        row("chat", DEFAULT_MODEL_PATH, self._chat is not None)
-        row("reader", READER_PATH, self._reader is not None)
+        row("chat", DEFAULT_MODEL_PATH, self._shared.get("chat") is not None)
+        row("reader", READER_PATH, self._shared.get("reader") is not None)
         row("unified", UNIFIED_PATH, UNIFIED_PATH in self._lms)
         row("instruct", INSTRUCT_PATH, INSTRUCT_PATH in self._lms)
         trained = [n for n in GAMES if game_model_path(n).exists()]
@@ -998,6 +1105,8 @@ _COMMANDS = {
     "think": SodaAgent._cmd_think,
     "reason": SodaAgent._cmd_think,
     "solve": SodaAgent._cmd_think,
+    "route": SodaAgent._cmd_route,
+    "routing": SodaAgent._cmd_route,
     "model": SodaAgent._cmd_model,
     "info": SodaAgent._cmd_model,
     "goal": SodaAgent._cmd_goal,
@@ -1022,6 +1131,8 @@ _HELP = [
      " 'write a python function that ...')"),
     ("/think <question>", "work a question out step by step, then answer (or just"
      " ask in chat: 'how many are left if ...')"),
+    ("/route <message>", "show which of me would answer a message, and how sure I"
+     " am (no argument: how the last one went)"),
     ("/model", "show models, or switch: expert | specialist | unified | instruct"),
     ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),

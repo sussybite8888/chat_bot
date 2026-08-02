@@ -24,6 +24,7 @@ Each model = an architecture + its data/training/inference, in one file:
     code          code.py       (expert add-on)  via ExpertLM      specialist-code.pt
     codegen       codegen.py    (expert add-on)  via ExpertLM      specialist-codegen.pt
     reason        reason.py     (expert add-on)  via ExpertLM      specialist-reason.pt
+    route         route.py      (expert add-on)  via ExpertLM      specialist-route.pt
 
 Architectures:
     MiniGPT       (model.py)   base decoder LM — chat, reader, games, unified, instruct
@@ -33,7 +34,11 @@ Architectures:
                                their own heads, e.g. vision) from specialist-*.pt
 
 The agent (agent.py) ties chat + games together and can run any of the single
-models via /model. Frontends: cli.py (terminal), discord_bot.py, google_chat.py.
+models via /model; which capability answers a plain-text message is decided by
+the routing specialist (route.py). Frontends: cli.py (plain terminal chat),
+agent.py's own terminal loop, and the chat rooms — discord_bot.py and
+google_chat.py, which run the full agent over the shared plumbing in rooms.py
+(one agent per room, one copy of the models).
 """
 
 from .engine import ChatEngine, Reply

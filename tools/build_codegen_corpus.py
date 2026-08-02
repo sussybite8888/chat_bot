@@ -1,9 +1,20 @@
 """Gather a permissively-licensed local code corpus for the codegen specialist.
 Only project roots whose OWN license is permissive (MIT/BSD/Apache/ISC); no VEX
 code (per user); minified/bundled/generated files filtered out; light whitespace
-normalization. Output: one NUL-separated blob of cleaned source files."""
+normalization.
+
+Output: one NUL-separated blob, each chunk `<repo-relative path>\\n<source>`.
+The path line is what `codegen._local_chunks` reads the language off, so the
+snippet can go into the training stream under a language header instead of
+being shuffled in untagged.
+
+Only extensions the codegen specialist actually writes are collected — the six
+CodeSearchNet languages plus TypeScript. C/C++ used to be 68% of this blob
+(micropython's core, quickjs, pico-sdk), and untagged C in a six-language
+stream is how JavaScript completions ended up emitting `#endif`."""
 import hashlib
 import os
+import re
 import sys
 
 HOME = os.path.expanduser("~")
@@ -16,21 +27,55 @@ ROOTS = [
     ("quickjs", None),                    # MIT
     ("Ogar", None),                       # Apache-2.0
     ("sb3topy", None),                    # BSD
-    ("restringer", None),                 # MIT
     ("agar.io-clone", None),              # MIT
     ("raspberrypi-pico", None),           # MIT
     ("unfinished-florr-clone", None),     # MIT
     ("html-css-javascript-games", None),  # MIT
-    ("flooooio", None),                   # MIT (minified -> filtered to nothing)
+    ("flooooio", None),                   # MIT (dense client code; filters trim it)
+    # restringer (MIT) is deliberately absent: it is a *deobfuscator*, so
+    # tests/resources is a directory of obfuscated JavaScript — _0x names,
+    # jsfuck, eval-packed payloads — and its own tests embed those samples as
+    # string literals. Exactly what this corpus must not teach.
 ]
 
-EXTS = {".py", ".js", ".mjs", ".ts", ".jsx", ".c", ".cc", ".cpp", ".cxx",
-        ".h", ".hpp", ".hh", ".java", ".go", ".rb", ".php", ".rs", ".lua"}
+# The languages the codegen specialist writes (six CodeSearchNet + TypeScript).
+# Anything else is left out rather than fed in as untagged filler.
+EXTS = {".py", ".js", ".mjs", ".jsx", ".ts", ".java", ".go", ".rb", ".php"}
 SKIP_DIRS = {"node_modules", ".git", "build", "dist", "out", "__pycache__",
-             ".venv", "coverage", ".cache", "vendor", "min"}
+             ".venv", "coverage", ".cache", "vendor", "min", "resources"}
 MAX_BYTES = 250_000       # skip generated/huge single files
-MAX_LINE = 2000           # skip minified/bundled (one giant line)
-MAX_AVG_LINE = 250        # skip dense/minified even without one huge line
+MAX_LINE = 400            # skip minified/bundled (one giant line)
+MAX_AVG_LINE = 120        # skip dense/minified even without one huge line
+MAX_SHORT_IDENT = 0.5     # skip mangled names (mostly 1-2 character identifiers)
+# The last two are shape heuristics, and only JS/TS is shipped minified: Go
+# names its receivers `p` and its buffers `b`, so "mostly short identifiers" is
+# idiom there rather than mangling.
+MINIFIED_EXTS = {".js", ".mjs", ".jsx", ".ts"}
+
+# Minifier / bundler / transpiler / obfuscator fingerprints. Such code is valid
+# and licence-clean, so nothing else here rejects it, but training on it teaches
+# the model to write mangled names and helper-call soup.
+MACHINE = [
+    re.compile(r"_0x[0-9a-f]{3,}"),                       # obfuscator.io names
+    re.compile(r"(\\x[0-9a-fA-F]{2}){3,}"),               # hex-escaped blobs
+    re.compile(r"(\\u[0-9a-fA-F]{4}){3,}"),               # unicode-escaped blobs
+    re.compile(r"\+!\+\[\]|\[\]\[\(!\[\]"),               # jsfuck
+    re.compile(r"\beval\s*\(\s*(function|atob|unescape|String\.fromCharCode)"),
+    re.compile(r"String\.fromCharCode\(\s*(?:0x[0-9a-f]+|\d+)\s*"
+               r"(?:,\s*(?:0x[0-9a-f]+|\d+)\s*){4,}\)"),
+    re.compile(r"_WEBPACK_IMPORTED_MODULE|__webpack_"),   # bundler output
+    re.compile(r"_interopRequireDefault|\b_\w+2\.default\b"),   # babel interop
+    re.compile(r"\b_(classCallCheck|createClass|possibleConstructorReturn|"
+               r"slicedToArray|toConsumableArray|objectSpread|inherits)\b"),
+]
+IDENT = re.compile(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b")
+KEYWORDS = frozenset(
+    "var let const function return if else for while new this typeof in of class "
+    "extends super null true false undefined try catch throw switch case break "
+    "continue do delete void instanceof yield await async static get set import "
+    "export from default require module exports def self end elsif nil puts func "
+    "package type struct interface map range go defer chan public private static "
+    "int void string bool echo".split())
 
 
 def _norm(text: str) -> str:
@@ -54,10 +99,17 @@ def _keep(path: str, text: str) -> bool:
     mx = max((len(x) for x in lines), default=0)
     if mx > MAX_LINE:
         return False
-    if len(text) / max(len(lines), 1) > MAX_AVG_LINE:
-        return False
     # crude binary/text guard
     if "\x00" in text:
+        return False
+    if any(rx.search(text) for rx in MACHINE):
+        return False
+    if os.path.splitext(path)[1].lower() not in MINIFIED_EXTS:
+        return True
+    if len(text) / max(len(lines), 1) > MAX_AVG_LINE:
+        return False
+    names = [i for i in IDENT.findall(text) if i not in KEYWORDS]
+    if names and sum(1 for i in names if len(i) <= 2) / len(names) > MAX_SHORT_IDENT:
         return False
     return True
 
@@ -97,7 +149,9 @@ def main() -> None:
                         skipped += 1
                         continue
                     seen.add(h)
-                    chunks.append(text)
+                    # First line is the path: codegen._local_chunks reads the
+                    # language off its extension and strips it back off.
+                    chunks.append(f"{os.path.relpath(fp, HOME)}\n{text}")
                     per_ext[ext] = per_ext.get(ext, 0) + 1
                     kept += 1
     blob = "\0".join(chunks)

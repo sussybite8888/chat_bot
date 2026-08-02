@@ -162,8 +162,32 @@ nothing — on a tight machine use `--batch-size 16`.
    .venv/bin/python -m sodachat.discord_bot
    ```
 
-The bot replies to DMs and @mentions, keeping short per-channel history. Set
-`DISCORD_RESPOND_ALL=1` to reply to every message it can read.
+The bot replies to DMs and @mentions. Set `DISCORD_RESPOND_ALL=1` to reply to
+every message it can read.
+
+**It runs the whole agent, not just chat.** A channel gets what the terminal
+gets: the [routing specialist](#a-routing-specialist-deciding-which-of-them-answers-you)
+picks which capability answers each message, and `/help`, `/play snake`,
+`/gen`, `/think`, `/route`, `/model` all work. Three things are specific to a
+chat room, and live in [rooms.py](sodachat/rooms.py):
+
+* **Post an image and it gets looked at**; post a `.py`/`.js`/… and it gets
+  read. This is the room equivalent of dropping a file into the terminal — the
+  attachment is downloaded to a scratch directory, the agent recognizes it as a
+  path, and the vision or code specialist takes it. Follow-ups work the same way
+  too (*"what was in that picture?"*). Files it can't use get a reason rather
+  than silence.
+* **Each channel is its own conversation** — its own history, its own running
+  game, its own memory of the last image seen — while the models are loaded once
+  and shared. A second channel costs 0 MB, measured.
+* **Boards and code are fenced, long replies are split.** A 20×20 snake board or
+  a `/help` table is column-aligned text that a proportional font destroys, so
+  the block paragraphs (and only those) go in a code fence, and anything over
+  Discord's 2000-character limit is split without leaving a fence unclosed.
+
+Generation runs in a worker thread, one reply at a time, so the gateway
+heartbeat and the typing indicator keep going while the model writes. Set
+`SODACHAT_AGENT=0` for the old plain-chat behaviour.
 
 ## Google Chat
 
@@ -192,11 +216,26 @@ and renders the JSON it returns.
    then verified as coming from Google Chat. Without it the endpoint accepts
    unauthenticated requests (fine for local testing only).
 
+Like the Discord bot, this runs the full agent: routing, `/commands`, games, and
+one agent per Chat space with the models shared between them. Two differences
+from Discord, both forced by the platform:
+
+* **Attachments aren't read.** Google Chat sends a *reference* to an uploaded
+  file, and fetching it needs the Chat API with service-account credentials —
+  where Discord hands over a URL the bot can already use. So an upload arrives
+  as an empty message with metadata, and the app says that rather than ignoring
+  it. `/see <path>` and `/code <path>` still work for files on the server.
+* **One event, one reply**, so there is nowhere to put overflow: a reply past
+  4096 characters is cut and marked, instead of split across messages.
+
 Smoke-test without Google:
 
 ```sh
 curl -s -X POST localhost:8080/ -H 'Content-Type: application/json' \
   -d '{"type":"MESSAGE","message":{"text":"hello there"}}'
+
+curl -s -X POST localhost:8080/ -H 'Content-Type: application/json' \
+  -d '{"type":"MESSAGE","message":{"text":"write me a python function that sorts a list"}}'
 ```
 
 ## Playing games
@@ -533,6 +572,36 @@ expert in `/model`, and dropping a source file into the chat (or
 and it continues the file; a plain-text follow-up like *"what language was
 that?"* is answered from what it read — the same pattern as `/see`.
 
+Actually *writing* code is a third specialist ([codegen.py](sodachat/codegen.py)),
+LM-trained on the same six languages, and two details of its diet decide whether
+the output reads like code a person wrote:
+
+**Every snippet trains under a language header** — an ordinary comment line
+(`// javascript`, `# python`), so still no new tokens. Six languages packed into
+one undifferentiated stream leaves `function foo(` as likely to continue in PHP
+or Java as in JavaScript, and mixing in a local corpus that was 68% C by bytes
+put `#endif` in the middle of JavaScript. The header turns the language into
+something generation can *ask for* rather than guess.
+
+**Machine-generated source is filtered out** of both corpora. Minified, bundled,
+transpiled and obfuscated code is syntactically valid and licence-clean, so no
+other filter rejects it — but it is exactly what teaches a model to write mangled
+one-letter names and helper-call soup, which is how a small model ends up
+emitting something that looks obfuscated. The shape heuristics (dense lines,
+mostly 1-2 character identifiers) apply only to JavaScript and TypeScript: Go
+names its receivers `p` and its buffers `b`, and reading that as mangling threw
+away 41% of the Go corpus.
+
+Sampling, on the other hand, turned out not to matter — worth recording, because
+the opposite is intuitive. Code repeats itself by nature (the loop counter and
+the accumulator recur every other line), so the repetition penalty looks like a
+suspect: penalize what you just wrote and the sampler has to reach for a fresh
+name. Measured over 56 samples × 7 prompts, it isn't one. The share of 1-2
+character identifiers is flat across penalties 1.0 / 1.1 / 1.15 (0.176 / 0.174 /
+0.176), while degenerate looping falls off steeply (repeated 4-grams 0.024 →
+0.023 → 0.009). Mangled output is a training-data problem; 1.15 is simply where
+a 17M expert stops looping.
+
 ### A reasoning specialist: thinking step by step
 
 Every specialist so far answers in one shot. The **reasoning** specialist
@@ -685,6 +754,113 @@ many are left if I have 12 apples and eat 3?") route here on their own. The
 trigger is deliberately conservative — chat is the default, and hijacking small
 talk to "reason" about it reads worse than missing a word problem.
 
+### A routing specialist: deciding which of them answers you
+
+Five specialists is four too many for a chain of `if`s. Until now the agent
+worked out what a plain-text message wanted with hand-written triggers — a regex
+per capability, tried in a fixed order — and the *order* was load-bearing: the
+reasoning check had to sit ahead of the code-Q&A check, whose word list contains
+`in` and would otherwise swallow every word problem. Each trigger only fires on
+the phrasings somebody thought of, and each new capability means re-deriving the
+whole ordering by hand.
+
+That cascade is a classifier with hand-tuned weights, so
+[route.py](sodachat/route.py) trains the real one — same frozen-trunk plug-in
+shape as the rest, a sixth specialist whose job is choosing between the other
+five:
+
+```
+<|route|>
+what language was that file again?
+<|dest|>                                -> code (0.94)
+```
+
+The destination reads off a 6-way class head at the trailing `<|dest|>` in a
+single forward pass — the same mechanism as the vision label, the code language
+and the game move. Six destinations, exactly the ones the agent can hand a bare
+message to:
+
+| route | goes to | trained from |
+|---|---|---|
+| `chat` | the chat model (the default) | DailyDialog + SODA + NPS Chat utterances |
+| `reason` | `reason.think` | GSM8K, Orca-Math, MetaMathQA, AQuA-RAT questions + generated short arithmetic |
+| `codegen` | `codegen.generate` | [MBPP](https://huggingface.co/datasets/google-research-datasets/mbpp) tasks + CodeSearchNet docstrings, wrapped in request phrasings |
+| `code` | the code specialist's last read | templated questions about a file just read |
+| `vision` | the vision specialist's last look | templated questions about an image just seen |
+| `game` | the reader | templated live-game questions + `reader`'s own question list |
+
+Unlike vision and code, this expert is seeded from the **text** expert rather
+than the game one: a user message is ordinary dialogue, not a glyph grid. Its
+`<|dest|>` marker is private rather than the shared `<|cls|>` on purpose — when
+two specialists share a marker token, whichever attaches first owns its
+embedding row and the later one's trained row is discarded, and a classifier
+reading its head at exactly that position is the one place that quirk really
+bites.
+
+**Three of the six classes are synthesized, and that is the honest weak point.**
+There is no public dataset of "messages people send a chatbot, labelled by which
+subsystem should answer", so `code`, `vision` and `game` are a few dozen
+skeletons crossed with slot values and roughened (fillers, punctuation, casing
+that comes and goes) — much easier than real messages. Two things keep the
+reported numbers from flattering that. The held-out split holds out whole
+**skeletons**, one in six by digest order, so a validation message's *shape* was
+never trained on rather than merely its slot values. And `route.PROBE` is ~50
+hand-written messages that came from no template at all — that number, not the
+held-out one, is the one to believe.
+
+**Chat is the class to protect**, because the two error directions don't cost
+the same: missing a request just means a chat reply, while a false positive
+answers small talk with generated code. So inference thresholds at 60% and falls
+back to chat below it, and `eval` reports the **chat leakage rate** — how much
+ordinary conversation gets confidently routed away — as the headline safety
+number.
+
+**The old triggers didn't go away.** They run when the router leaves a message
+in chat, and they are the whole story until the specialist is trained — so an
+agent without `specialist-route.pt` routes exactly as it did before, and
+`/route <message>` says so instead of pretending.
+
+```sh
+python -m sodachat.route train    # needs models/expert.pt; trunk stays frozen
+python -m sodachat.route eval     # held-out + hand-written probe accuracy
+python -m sodachat.route demo     # the probe set, message by message
+python -m sodachat.route ask "what language was that?"
+```
+
+**Measured** — 40.5k training messages, best-held-out checkpoint, both numbers at
+the 60% threshold:
+
+| | held-out (unseen skeletons) | probe (hand-written) |
+|---|---|---|
+| macro accuracy | **95.5%** | **80.6%** |
+| chat leakage | 1.6% | **0%** (14/14 stay in chat) |
+| per class | chat 98%, codegen 99%, code 99%, vision 98%, reason 89%, game 89% | chat 100%, game 100%, reason 88%, code 67%, vision 67%, codegen 63% |
+
+The 15-point gap between the two columns is the synthesized-class tax, and it is
+the honest number: held-out `code` and `vision` score ~98% on phrasings the
+generator produced, ~67% on phrasings a person wrote. Training longer makes that
+worse, not better — a 4,000-step run peaked on held-out accuracy at step **500**
+and then drove probe accuracy from 81% down to 69% while the held-out number sat
+still, which is what fitting a template generator looks like from the outside.
+The default schedule is short for that reason, and only the best held-out
+checkpoint is kept.
+
+**The misses degrade the right way.** Eight of the 48 probe messages are
+misrouted; run end to end through the agent, the old triggers recover **three**
+of them. *"Work out how many minutes there are in a fortnight"* routes to chat at
+53%, under the threshold, and the reasoning trigger picks it up. *"Build me a
+class that wraps an http client with retries"* routes to chat and the codegen
+trigger catches it. *"Can you code up a debounce helper in js"* is the
+interesting one: the router confidently says `code`, but with no file read yet
+that handler declines rather than inventing an answer, and codegen takes it —
+and gets the language right.
+
+The other five get a chat reply, which is the cheap failure. What did *not*
+happen anywhere in the probe set is the expensive one: no ordinary message was
+confidently routed away from chat, so nothing answered small talk with generated
+code. That asymmetry is what the threshold buys, and it is the reason the router
+is worth switching on at 80% rather than waiting for 95%.
+
 ### Consistent latency (why real-time control works)
 
 For real-time control, *worst-case* latency matters more than the average — a
@@ -771,14 +947,19 @@ sodachat/
                   #   a frozen-trunk expert add-on -> models/specialist-codegen.pt
   reason.py       # reasoning specialist (step-by-step then answer), 7 public CoT
                   #   datasets -> models/specialist-reason.pt
+  route.py        # routing specialist: which capability answers a message,
+                  #   a frozen-trunk expert add-on -> models/specialist-route.pt
   narrate.py      # multi-head model (MultiHeadGPT): action head + LM commentary in one pass
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/
   engine.py       # chat generation + MMI relevance reranking
   cli.py          # terminal chat UI (rich)
-  discord_bot.py  # Discord chat frontend (discord.py)
-  google_chat.py  # Google Chat frontend (FastAPI webhook)
-  agent.py        # unified interface: chat (plain text) + /commands for games
+  rooms.py        # shared chat-room plumbing: one agent per room over one set of
+                  #   models, attachment staging, code fencing, message splitting
+  discord_bot.py  # Discord chat frontend (discord.py), running the full agent
+  google_chat.py  # Google Chat frontend (FastAPI webhook), running the full agent
+  agent.py        # unified interface: chat (plain text) + /commands for games;
+                  #   plain text is dispatched by the routing specialist
   reader.py       # small model that reads game state to answer questions
   game_train.py   # behaviour-cloning trainer for game control
   play.py         # real-time terminal UI for grid games (rich.Live)

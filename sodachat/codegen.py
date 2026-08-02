@@ -24,6 +24,15 @@ Design choices that make generation work as well as a ~14M frozen trunk allows:
   * Training packs cleaned function bodies into one stream, snippets separated by
     `<|end|>`, and samples fixed-width windows — the standard LM diet, but every
     token routed to the code-generator expert.
+  * **Each snippet carries a language header** (`// javascript`, `# python`) —
+    an ordinary comment line, so still no new tokens. Six languages in one
+    undifferentiated stream left `function foo(` as likely to continue in PHP or
+    Java as in JavaScript; the header makes the language something generation can
+    ask for (`generate(..., lang="javascript")`) instead of guess.
+  * **Machine-generated source is dropped** from both corpora — minified,
+    bundled, transpiled and obfuscated code is valid and licence-clean, so
+    nothing else rejects it, but it is precisely what teaches a model to write
+    mangled names and helper-call soup (see `_machine_generated`).
 
 Quality is bounded by the frozen trunk (a ~14M model on a chat/game diet) and a
 BPE vocabulary built for dialogue, so treat this as a small, code-flavoured
@@ -42,6 +51,7 @@ same six languages code.py classifies (python, java, javascript, php, ruby, go).
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -65,34 +75,139 @@ from .expert import (
 NAME = "codegen"
 DEFAULT_PATH = _MODELS / "specialist-codegen.pt"
 # A permissively-licensed local code corpus (built off-box from MIT/BSD/Apache
-# projects on disk, one file per NUL-separated chunk), mixed in with
-# CodeSearchNet when present. Absent -> CodeSearchNet only.
+# projects on disk by tools/build_codegen_corpus.py — one file per NUL-separated
+# chunk, each chunk `<path>\n<source>`), mixed in with CodeSearchNet when
+# present. Absent -> CodeSearchNet only.
 LOCAL_PATH = _MODELS / "codegen-local.txt"
 BLOCK = 512   # code snippets are short; a 512-token window spans a few functions
 
+# Every snippet enters the stream under a one-line header written in its own
+# language's comment syntax:
+#
+#     // javascript
+#     function debounce(fn, ms) { ... }
+#     <|end|>
+#
+# Without it the six languages are one undifferentiated stream, and a `function
+# foo(` prompt is as likely to be continued as PHP or Java as JavaScript. The
+# header costs one line, needs no new tokens (it is ordinary source text, which
+# is the whole point — see the module docstring), and gives generation a knob:
+# `generate(..., lang="javascript")` prepends the same line it was trained on.
+COMMENT = {"python": "#", "ruby": "#", "javascript": "//", "typescript": "//",
+           "java": "//", "php": "//", "go": "//", "c": "//", "cpp": "//"}
+# Local-corpus extensions, mapped onto the languages this specialist writes.
+# Anything not listed here (.c/.h/.cpp/.rs/.lua ...) is dropped: C was 68% of
+# the local blob by bytes, and untagged C in a six-language stream is where JS
+# completions picked up `#endif` and template syntax.
+LOCAL_EXTS = {".py": "python", ".js": "javascript", ".mjs": "javascript",
+              ".jsx": "javascript", ".ts": "typescript", ".go": "go",
+              ".rb": "ruby", ".php": "php", ".java": "java"}
 
-# --------------------------------------------------------------- data → stream
+# Machine-generated JavaScript — minifier, bundler, transpiler and obfuscator
+# output. It is syntactically valid and licence-clean, so nothing upstream
+# rejects it, but training on it teaches the model to *write* mangled names and
+# helper-call soup, which is what obfuscated output looks like.
+_MACHINE = [
+    re.compile(r"_0x[0-9a-f]{3,}"),                       # obfuscator.io names
+    re.compile(r"(\\x[0-9a-fA-F]{2}){3,}"),               # hex-escaped blobs
+    re.compile(r"(\\u[0-9a-fA-F]{4}){3,}"),               # unicode-escaped blobs
+    re.compile(r"\+!\+\[\]|\[\]\[\(!\[\]"),               # jsfuck
+    re.compile(r"\beval\s*\(\s*(function|atob|unescape|String\.fromCharCode)"),
+    re.compile(r"String\.fromCharCode\(\s*(?:0x[0-9a-f]+|\d+)\s*"
+               r"(?:,\s*(?:0x[0-9a-f]+|\d+)\s*){4,}\)"),
+    re.compile(r"_WEBPACK_IMPORTED_MODULE|__webpack_"),   # bundler output
+    re.compile(r"_interopRequireDefault|\b_\w+2\.default\b"),   # babel interop
+    re.compile(r"\b_(classCallCheck|createClass|possibleConstructorReturn|"
+               r"slicedToArray|toConsumableArray|objectSpread|inherits)\b"),
+]
+_IDENT = re.compile(r"\b[A-Za-z_$][A-Za-z0-9_$]*\b")
+_KEYWORDS = frozenset(
+    "var let const function return if else for while new this typeof in of class "
+    "extends super null true false undefined try catch throw switch case break "
+    "continue do delete void instanceof yield await async static get set import "
+    "export from default require module exports def self end elsif nil puts func "
+    "package type struct interface map range go defer chan public private static "
+    "int void string bool echo".split())
 
 
-def _csn_texts(split: str, per_lang: int, rng: np.random.Generator) -> list[str]:
-    """CodeSearchNet function bodies across all six languages. `split` is
+# Shape heuristics (dense lines, mangled names) are for the languages that are
+# actually shipped minified. Go names its receivers `p` and its buffers `b`, and
+# Java is generic-heavy, so "mostly short identifiers" is idiom there, not
+# mangling — applying it to them threw away 41% of the Go corpus.
+_MINIFIED_LANGS = frozenset({"javascript", "typescript"})
+
+
+def _machine_generated(code: str, lang: str | None = None) -> bool:
+    """True for minified/bundled/transpiled/obfuscated source. Fingerprints and
+    absurd line lengths count against any language; the shape heuristics (dense
+    throughout, mostly 1-2 character identifiers) only against the ones that get
+    minified in practice."""
+    if any(rx.search(code) for rx in _MACHINE):
+        return True
+    lines = [ln for ln in code.split("\n") if ln.strip()]
+    if not lines:
+        return True
+    if max(len(ln) for ln in lines) > 400:          # a bundled one-liner
+        return True
+    if lang is not None and lang not in _MINIFIED_LANGS:
+        return False
+    if sum(len(ln) for ln in lines) / len(lines) > 120:   # dense throughout
+        return True
+    names = [i for i in _IDENT.findall(code) if i not in _KEYWORDS]
+    return bool(names) and sum(1 for i in names if len(i) <= 2) / len(names) > 0.5
+
+
+def _tag(lang: str, code: str) -> str:
+    """One snippet under its language header, ready for the stream."""
+    return f"{COMMENT.get(lang, '//')} {lang}\n{code.strip()}"
+
+
+def _csn_texts(split: str, per_lang: int, rng: np.random.Generator,
+               log=None) -> list[str]:
+    """CodeSearchNet function bodies across all six languages, each under its
+    language header and with machine-generated source dropped. `split` is
     "train" or "test" (held-out)."""
     texts: list[str] = []
     for lang in LANGS:
-        texts += _hf_snippets(lang, split, per_lang, rng)
+        raw = _hf_snippets(lang, split, per_lang, rng)
+        kept = [_tag(lang, s) for s in raw if not _machine_generated(s, lang)]
+        if log and len(kept) < len(raw):
+            log(f"  {lang}: dropped {len(raw) - len(kept)} of {len(raw)} "
+                f"machine-generated snippets")
+        texts += kept
     return texts
 
 
-def _local_chunks(path, rng: np.random.Generator, holdout: float = 0.08):
-    """The local permissive corpus split into (train, val) file lists. Empty
-    lists if the blob isn't present, so training falls back to CodeSearchNet."""
+def _local_chunks(path, rng: np.random.Generator, holdout: float = 0.08, log=None):
+    """The local permissive corpus split into (train, val) file lists, each file
+    tagged with the language its extension names and machine-generated source
+    dropped. Empty lists if the blob isn't present, so training falls back to
+    CodeSearchNet.
+
+    The builder (tools/build_codegen_corpus.py) writes `<path>\\n<source>` per
+    chunk so the language is recoverable here; blobs from the older, pathless
+    builder are skipped rather than fed in untagged."""
     if not Path(path).exists():
         return [], []
     blob = Path(path).read_text(encoding="utf-8", errors="ignore")
-    chunks = [c for c in blob.split("\0") if c.strip()]
-    rng.shuffle(chunks)
-    n_val = max(1, int(len(chunks) * holdout))
-    return chunks[n_val:], chunks[:n_val]
+    tagged, untagged = [], 0
+    for chunk in blob.split("\0"):
+        if not chunk.strip():
+            continue
+        head, _, body = chunk.partition("\n")
+        lang = LOCAL_EXTS.get(Path(head.strip()).suffix.lower()) if head else None
+        if lang is None or not body.strip():
+            untagged += 1
+            continue
+        if _machine_generated(body, lang):
+            continue
+        tagged.append(_tag(lang, body))
+    if log and untagged:
+        log(f"  skipped {untagged} local chunks with no usable language header "
+            f"(rebuild with tools/build_codegen_corpus.py)")
+    rng.shuffle(tagged)
+    n_val = max(1, int(len(tagged) * holdout)) if tagged else 0
+    return tagged[n_val:], tagged[:n_val]
 
 
 def _encode_stream(tok, texts: list[str], rng: np.random.Generator) -> np.ndarray:
@@ -166,9 +281,9 @@ def train(base=EXPERT_PATH, out=DEFAULT_PATH, steps=3000, batch_size=24, lr=3e-4
         f"(shared trunk + LM head frozen) | seeded from TEXT | device {device}")
 
     log(f"loading CodeSearchNet ({', '.join(LANGS)})...")
-    csn_train = _csn_texts("train", per_lang, rng)
+    csn_train = _csn_texts("train", per_lang, rng, log=log)
     csn_val = _csn_texts("test", per_lang // 4 + 50, rng)
-    local_train, local_val = _local_chunks(LOCAL_PATH, rng)
+    local_train, local_val = _local_chunks(LOCAL_PATH, rng, log=log)
     if local_train:
         log(f"+ local permissive corpus: {len(local_train):,} train / "
             f"{len(local_val):,} val files from {LOCAL_PATH.name}")
@@ -213,6 +328,7 @@ def train(base=EXPERT_PATH, out=DEFAULT_PATH, steps=3000, batch_size=24, lr=3e-4
                                 special_tokens=[], kind="generate", steps=step,
                                 val_acc=vloss, meta={"langs": LANGS, "block": block,
                                                      "source": "code_search_net",
+                                                     "lang_headers": True,
                                                      "val_loss": vloss})
             el = time.time() - started
             log(f"step {step:>5}/{steps} | train loss {loss.item():.3f} | val loss "
@@ -226,18 +342,45 @@ def train(base=EXPERT_PATH, out=DEFAULT_PATH, steps=3000, batch_size=24, lr=3e-4
 # ------------------------------------------------------------------ inference
 
 
+# Code repeats itself by nature — the loop counter and the accumulator recur
+# every other line — so the intuition is that a repetition penalty should hurt
+# here. Measured over 56 samples x 7 prompts on this checkpoint, it does not:
+# the share of 1-2 character identifiers is flat (0.176 / 0.174 / 0.176) across
+# penalties 1.0 / 1.1 / 1.15, while degenerate looping falls off steeply
+# (repeated 4-grams 0.024 -> 0.023 -> 0.009, duplicate lines 0.065 -> 0.034).
+# At 1.2 looping is lowest but short names start climbing (0.195). Mangled
+# output is a *training-data* problem, not a sampling one; 1.15 is where a
+# 17M expert stops looping without paying for it.
+REPETITION_PENALTY = 1.15
+
+
+def _header(lang: str | None) -> str:
+    """The language header a snippet was trained under, or "" for unconditional
+    generation (a checkpoint trained before headers existed)."""
+    return f"{COMMENT.get(lang, '//')} {lang}\n" if lang else ""
+
+
+def _tagged(lm: ExpertLM) -> bool:
+    """Whether this checkpoint was trained with language headers."""
+    return bool(lm.specialists[NAME].get("lang_headers"))
+
+
 @torch.no_grad()
 def complete(lm: ExpertLM, prefix: str, max_new_tokens: int = 128,
-             temperature: float = 0.6, top_p: float = 0.95) -> str:
+             temperature: float = 0.6, top_p: float = 0.95,
+             lang: str | None = None) -> str:
     """Continue a code snippet. Every token — the prefix and each sampled token —
     is routed through the code-generator expert and read off the shared LM head,
-    stopping at `<|end|>`. Quality is bounded by the frozen trunk; treat it as
-    code-flavoured autocomplete."""
+    stopping at `<|end|>`. Pass `lang` to condition on a language header (see
+    `_tag`); it is ignored by checkpoints trained without one. Quality is bounded
+    by the frozen trunk; treat it as code-flavoured autocomplete."""
     task = lm.specialists[NAME]["task"]
     end = lm.tok.token_id(END)
-    idx = lm._ids(prefix.rstrip("\n") + "\n")
+    head = _header(lang) if _tagged(lm) else ""
+    idx = lm._ids(head + prefix.rstrip("\n") + "\n")
     out = lm.model.generate_text(idx, task, max_new_tokens, temperature,
-                                 top_k=40, top_p=top_p, repetition_penalty=1.15,
+                                 top_k=40, top_p=top_p,
+                                 repetition_penalty=REPETITION_PENALTY,
                                  stop_tokens=[end])
     text = lm.tok.decode(out[0][idx.shape[1]:].tolist())
     return text.split("<|end|>")[0].rstrip()
@@ -245,16 +388,21 @@ def complete(lm: ExpertLM, prefix: str, max_new_tokens: int = 128,
 
 @torch.no_grad()
 def generate(lm: ExpertLM, seed: str, max_new_tokens: int = 160,
-             temperature: float = 0.6, top_p: float = 0.95) -> str:
+             temperature: float = 0.6, top_p: float = 0.95,
+             lang: str | None = None) -> str:
     """Continue `seed` **verbatim** (no reformatting or appended newline, unlike
     `complete`), routed through the codegen expert — used to turn a seed (a
-    comment describing the task plus a function header) into code. Returns just
+    comment describing the task plus a function header) into code. `lang`
+    prepends the training-time language header so the continuation commits to
+    one language instead of drifting across the six in the stream. Returns just
     the generated continuation, stopping at `<|end|>`."""
     task = lm.specialists[NAME]["task"]
     end = lm.tok.token_id(END)
-    idx = lm._ids(seed)
+    head = _header(lang) if _tagged(lm) else ""
+    idx = lm._ids(head + seed)
     out = lm.model.generate_text(idx, task, max_new_tokens, temperature,
-                                 top_k=40, top_p=top_p, repetition_penalty=1.15,
+                                 top_k=40, top_p=top_p,
+                                 repetition_penalty=REPETITION_PENALTY,
                                  stop_tokens=[end])
     return lm.tok.decode(out[0][idx.shape[1]:].tolist()).split("<|end|>")[0].rstrip()
 
@@ -276,19 +424,20 @@ def evaluate(path=DEFAULT_PATH, base=EXPERT_PATH, per_lang=800, device=None,
 
 
 _PROMPTS = [
-    "def quicksort(arr):",
-    "def is_prime(n):",
-    "function debounce(fn, delay) {",
-    "public static int gcd(int a, int b) {",
+    ("python", "def quicksort(arr):"),
+    ("python", "def is_prime(n):"),
+    ("javascript", "function debounce(fn, delay) {"),
+    ("javascript", "function shuffle(arr) {"),
+    ("java", "public static int gcd(int a, int b) {"),
 ]
 
 
 def demo(path=DEFAULT_PATH, base=EXPERT_PATH, device="cpu",
          max_new_tokens=80) -> None:
     lm = ExpertLM(base, device, specialists=[path])
-    for prompt in _PROMPTS:
-        cont = complete(lm, prompt, max_new_tokens=max_new_tokens)
-        print(f"{prompt}\n{cont}\n{'-' * 60}")
+    for lang, prompt in _PROMPTS:
+        cont = complete(lm, prompt, max_new_tokens=max_new_tokens, lang=lang)
+        print(f"{_header(lang) if _tagged(lm) else ''}{prompt}\n{cont}\n{'-' * 60}")
 
 
 def main() -> None:
@@ -317,6 +466,8 @@ def main() -> None:
                     "(default: read stdin)")
     cp.add_argument("--max-new-tokens", type=int, default=128)
     cp.add_argument("--device", default="cpu")
+    cp.add_argument("--lang", default=None, choices=sorted(COMMENT),
+                    help="language to condition on (default: unconditional)")
     a = p.parse_args()
     if a.cmd == "train":
         train(steps=a.steps, batch_size=a.batch_size, lr=a.lr,
@@ -330,7 +481,7 @@ def main() -> None:
 
         text = Path(a.file).read_text() if a.file else sys.stdin.read()
         lm = ExpertLM(EXPERT_PATH, a.device, specialists=[DEFAULT_PATH])
-        print(complete(lm, text, max_new_tokens=a.max_new_tokens))
+        print(complete(lm, text, max_new_tokens=a.max_new_tokens, lang=a.lang))
     else:
         p.print_help()
 
