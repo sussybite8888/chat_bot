@@ -310,18 +310,36 @@ python tools/dump_engine_cases.py  && npm run check:model
 ```
 
 which covers, respectively: every exported graph against the module it came
-from (max |Δlogit| ~2e-5, prefill *and* single-token steps off a cache);
-44 encode/decode cases against the Python tokenizer; and the JavaScript against
-PyTorch end to end — greedy ids exactly, log-probs, classifier confidences and
-action-head moves to within fp32 noise.
+from (max |Δlogit| ~2e-5, prefill *and* single-token steps off a cache — and the
+export **fails** rather than warns if that drifts); 44 encode/decode cases
+against the Python tokenizer; and the JavaScript against PyTorch end to end —
+greedy ids exactly, log-probs, classifier confidences and action-head moves to
+within fp32 noise.
 
 ```
-chat: done                    expert-route: done
-expert-text: done             expert-code: done
-expert-game: done
-chat reply: "Not much, just went to school and then came home." (rel 0.50, 11 candidates)
-expert-text reply: "Not much, just hung out at home." (rel 1.02, 11 candidates)
+44/44 cases match
+chat reply: "Not much, just hung out at home. What about you?" (rel 0.43, 12 candidates)
+expert-text reply: "I went to school and then came home." (rel 0.98, 12 candidates)
 26/26 checks pass
+```
+
+Those run the browser's code under Node, which leaves out what the browser
+itself adds — module resolution, WASM instantiation, cross-origin isolation,
+the DOM. `npm run check:browser` closes that gap by driving the page in a real
+Chrome (optional: needs `puppeteer-core` and a browser, and skips cleanly
+without them). It is worth having; both bugs it caught on its first run were
+invisible to everything above:
+
+```
+chat            webgpu · 4 threads     Chat → "Not much, just ran some errands. You?"
+expert-text     webgpu · 4 threads     Chat → "Just hung out at home. You know, the usual stuff."
+expert-game     webgpu · 4 threads     Play snake → 20-row board, score 0
+expert-code     webgpu · 4 threads     Classify → python · 100.0% confident
+expert-codegen  webgpu · 4 threads     Generate → 95 tokens
+expert-reason   webgpu · 4 threads     Generate → 117 tokens
+expert-route    webgpu · 4 threads     Classify → reason · 100.0% confident
+expert-vision   webgpu · 4 threads     Classify → airplane · 70.3% confident
+8 models OK
 ```
 
 `sodachat.web` is a static file server and nothing else — it sends the COOP/COEP
@@ -1076,4 +1094,5 @@ tools/            # build + parity checks for the above
   vendor_ort.mjs        # copy onnxruntime-web out of node_modules
   dump_tokenizer_cases.py / check_tokenizer.mjs   # JS tokenizer == Python
   dump_engine_cases.py   / check_web_engine.mjs   # JS runtime  == PyTorch
+  check_browser.mjs     # the page in a real Chrome (optional, skips if absent)
 ```

@@ -8,7 +8,7 @@
 // else's server. It also means the app works offline and behind a firewall,
 // like every other frontend in this repo.
 
-import { copyFileSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,14 +16,15 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const from = join(root, "node_modules", "onnxruntime-web", "dist");
 const to = join(root, "web", "vendor", "ort");
 
-// The bundled ESM build plus the WASM binaries it loads at runtime. `jsep` is
-// the WebGPU-capable build — same file serves the wasm backend, so shipping it
-// is what lets the page offer WebGPU where the browser has it.
-const WANTED = [
-  "ort.webgpu.bundle.min.mjs",
-  "ort-wasm-simd-threaded.jsep.mjs",
-  "ort-wasm-simd-threaded.jsep.wasm",
-];
+// The WebGPU bundle, which also serves the wasm backend — so one file is what
+// lets the page use WebGPU where the browser has it and fall back where it
+// doesn't.
+const BUNDLE = "ort.webgpu.bundle.min.mjs";
+
+// Which WASM binaries that bundle loads is a detail of the release: 1.23 shipped
+// a `jsep` pair, 1.27 an `asyncify` one. Rather than pin a guess that breaks on
+// the next upgrade, read the names back out of the bundle itself.
+const WASM_REFERENCE = /ort-wasm[\w.-]*\.(?:mjs|wasm)/g;
 
 try {
   statSync(from);
@@ -32,15 +33,28 @@ try {
   process.exit(1);
 }
 
-mkdirSync(to, { recursive: true });
 const available = new Set(readdirSync(from));
+if (!available.has(BUNDLE)) {
+  console.error(`missing ${BUNDLE} in onnxruntime-web/dist — has the layout changed?`);
+  process.exit(1);
+}
+const referenced = [...new Set(readFileSync(join(from, BUNDLE), "utf8").match(WASM_REFERENCE))];
+if (!referenced.length) {
+  console.error(`${BUNDLE} names no .wasm runtime — cannot tell what to vendor`);
+  process.exit(1);
+}
+
+mkdirSync(to, { recursive: true });
 let copied = 0;
-for (const name of WANTED) {
+for (const name of [BUNDLE, ...referenced]) {
   if (!available.has(name)) {
-    console.error(`missing ${name} in onnxruntime-web/dist — has the layout changed?`);
+    console.error(`${BUNDLE} wants ${name}, which is not in onnxruntime-web/dist`);
     process.exit(1);
   }
   copyFileSync(join(from, name), join(to, name));
   copied += statSync(join(to, name)).size;
 }
-console.log(`vendored ${WANTED.length} files (${(copied / 1e6).toFixed(1)} MB) into web/vendor/ort`);
+console.log(
+  `vendored ${1 + referenced.length} files (${(copied / 1e6).toFixed(1)} MB) into web/vendor/ort:` +
+    `\n  ${[BUNDLE, ...referenced].join("\n  ")}`,
+);

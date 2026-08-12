@@ -38,7 +38,10 @@ let history = [];
 async function bootRuntime() {
   const ort = await import("../vendor/ort/ort.webgpu.bundle.min.mjs");
   globalThis.ort = ort;
-  ort.env.wasm.wasmPaths = "vendor/ort/";
+  // Absolute, not "vendor/ort/": the runtime loads its WASM glue with a dynamic
+  // import, and a bare relative path is a *module specifier* there — which
+  // resolves against nothing and fails before any backend starts.
+  ort.env.wasm.wasmPaths = new URL("../vendor/ort/", import.meta.url).href;
   ort.env.wasm.numThreads = self.crossOriginIsolated
     ? Math.min(4, navigator.hardwareConcurrency || 1)
     : 1;

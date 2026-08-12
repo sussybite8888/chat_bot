@@ -78,6 +78,9 @@ export class OnnxLM {
     const session = await ort().InferenceSession.create(new Uint8Array(graph), {
       executionProviders: providers ?? ["wasm"],
       graphOptimizationLevel: "all",
+      // Errors only. Otherwise every load reports, as a console *error*, that
+      // some shape ops were placed on CPU — which is ORT working as intended.
+      logSeverityLevel: 3,
     });
     return new OnnxLM(session, spec, Tokenizer.fromJSON(tokenizerJson));
   }
