@@ -20,7 +20,6 @@ pad_load, …) live in `blocks.py` and are re-exported here for compatibility.
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -39,6 +38,7 @@ from .blocks import (  # noqa: F401
     GPTConfig,
     RMSNorm,
     _rope_cache,
+    config_from_payload,
     pad_load,
     pick_device,
     tokenizer_from_payload,
@@ -99,11 +99,16 @@ class MiniGPT(nn.Module):
         self.head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight  # weight tying
         self.apply(self._init_weights)
-        # Scale down the residual-path output projections by depth, so the
-        # residual stream does not blow up in deeper stacks (GPT-2 init).
+        # Zero the residual-path output projections, so every block starts as
+        # exactly the identity and the residual stream carries the embedding
+        # untouched at step 0. This replaces GPT-2's depth-scaled init, which
+        # aimed at the same problem — a residual stream that grows with depth —
+        # by shrinking the branches rather than switching them off. Nothing
+        # stays stuck at zero: a zeroed projection still receives gradient on
+        # its first step, and the layers feeding it start learning right after.
         for name, p in self.named_parameters():
             if name.endswith(("proj.weight", "down.weight")):
-                nn.init.normal_(p, std=0.02 / math.sqrt(2 * cfg.n_layer))
+                nn.init.zeros_(p)
         # RoPE angles are fixed, not learned — cache them per (device, dtype).
         self._rope: dict = {}
 
@@ -133,17 +138,47 @@ class MiniGPT(nn.Module):
             self._rope[key] = cached
         return cached[0][:T], cached[1][:T]
 
+    @staticmethod
+    def _doc_mask(doc_ids: torch.Tensor, T: int) -> torch.Tensor:
+        """A (B, 1, T, T) attention mask that is causal *and* confined to one
+        document.
+
+        Training windows are random crops of a stream of packed dialogues, so a
+        window nearly always straddles a boundary. Plain causal attention lets
+        the tail of one conversation attend back into an unrelated one, and the
+        model spends capacity learning to ignore it. Masking to the current
+        document removes the distraction outright. Every row keeps at least its
+        own position, so no row is fully masked.
+        """
+        same_doc = doc_ids[:, :, None] == doc_ids[:, None, :]
+        causal = torch.ones(T, T, dtype=torch.bool, device=doc_ids.device).tril()
+        return (same_doc & causal).unsqueeze(1)
+
     def forward(
-        self, idx: torch.Tensor, targets: torch.Tensor | None = None
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        doc_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T = idx.shape
         x = self.drop(self.tok_emb(idx))
         cos, sin = self._rope_for(T, x.device, x.dtype)
+        attn_mask = None if doc_ids is None else self._doc_mask(doc_ids, T)
         for block in self.blocks:
-            x = block(x, cos, sin)
+            x = block(x, cos, sin, attn_mask)
         logits = self.head(self.ln_f(x))
+        if self.cfg.logit_softcap:
+            # Squash logits into (-cap, cap). A from-scratch model will happily
+            # drive a few logits far out to win the cross-entropy on easy
+            # tokens; capping keeps the softmax in a range where gradients stay
+            # informative, and takes the lid off the learning rate (Gemma 2).
+            cap = self.cfg.logit_softcap
+            logits = cap * torch.tanh(logits / cap)
         loss = None
         if targets is not None:
+            # Targets of -100 are ignored — see `_batch` in train.py, which
+            # drops the one position per document whose next token belongs to
+            # the following document.
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.reshape(-1)
             )
@@ -209,7 +244,7 @@ def load_checkpoint(
 ) -> tuple[MiniGPT, CharTokenizer | BPETokenizer]:
     device = device or pick_device()
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    model = MiniGPT(GPTConfig(**ckpt["config"]))
+    model = MiniGPT(config_from_payload(ckpt["config"]))
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
     if "tokenizer" in ckpt:

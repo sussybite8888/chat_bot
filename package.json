@@ -1,0 +1,14 @@
+{
+  "name": "sodachat-web",
+  "private": true,
+  "type": "module",
+  "description": "Browser backend for sodachat: onnxruntime-web running the exported models.",
+  "scripts": {
+    "vendor": "node tools/vendor_ort.mjs",
+    "check:tokenizer": "node tools/check_tokenizer.mjs",
+    "check:model": "node tools/check_web_engine.mjs"
+  },
+  "devDependencies": {
+    "onnxruntime-web": "^1.23.0"
+  }
+}

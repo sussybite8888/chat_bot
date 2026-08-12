@@ -34,7 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import GPTConfig, make_amp, pick_device
+from .blocks import GPTConfig, config_from_payload, make_amp, pick_device
 from .games.snake import BODY, EMPTY, FOOD, HEAD, SnakeGame
 from .model import MiniGPT
 
@@ -266,7 +266,7 @@ class NarratingPlayer:
             torch.set_num_threads(1)
         ckpt = torch.load(path, map_location=device, weights_only=True)
         self.tok = NarrateTokenizer.from_payload(ckpt["tokenizer"])
-        self.model = MultiHeadGPT(GPTConfig(**ckpt["config"]), ckpt["n_actions"])
+        self.model = MultiHeadGPT(config_from_payload(ckpt["config"]), ckpt["n_actions"])
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.to(device).eval()
         self.device = device

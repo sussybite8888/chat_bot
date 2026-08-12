@@ -4,3 +4,6 @@ __pycache__/
 .env
 models/
 bot_token
+web/models/
+web/vendor/
+node_modules/

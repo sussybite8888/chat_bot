@@ -385,11 +385,11 @@ def load_model(path: Path, device: str | None = None):
     """Load a game-controller checkpoint -> (model, tokenizer, game_name)."""
     import torch
 
-    from ..model import GPTConfig, MiniGPT, pick_device
+    from ..model import MiniGPT, config_from_payload, pick_device
 
     device = device or pick_device()
     ckpt = torch.load(path, map_location=device, weights_only=True)
-    model = MiniGPT(GPTConfig(**ckpt["config"]))
+    model = MiniGPT(config_from_payload(ckpt["config"]))
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
     tok = tokenizer_from_payload(ckpt["tokenizer"])

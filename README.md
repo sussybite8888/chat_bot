@@ -3,8 +3,9 @@
 A tiny GPT (~1–14M parameters), trained from scratch on your own machine, put
 to two uses that lean on its speed and small size:
 
-- **A chatbot** with a terminal UI, a Discord bot, and a Google Chat app
-  sharing one engine.
+- **A chatbot** with a terminal UI, a Discord bot, a Google Chat app, and a
+  browser page sharing one engine — the last of those running the model
+  client-side via ONNX Runtime Web (see [In the browser](#in-the-browser-onnx-runtime-web)).
 - **A game controller** — the same architecture, small enough to pick an
   action every frame, trained to play Snake, Pong, Dodge, and Tic-Tac-Toe. One
   agent both chats and plays (see [Playing games](#playing-games)).
@@ -13,22 +14,30 @@ Two model backends:
 
 | Backend | What it is | Notes |
 |---|---|---|
-| `mini` (default) | A ~14M-param GPT (RoPE / RMSNorm / SwiGLU) with an 8k BPE subword vocabulary, both trained **from scratch** on [SODA](https://huggingface.co/datasets/allenai/soda) (~1.2M narrative-grounded dialogues, ~210M tokens) | Wants a GPU: ~6h. No pretrained weights anywhere. |
+| `mini` (default) | A ~14M-param GPT (RoPE / RMSNorm / QK-norm / squared-ReLU FFN / logit softcap) with an 8k BPE subword vocabulary, both trained **from scratch** on [SODA](https://huggingface.co/datasets/allenai/soda) (~1.2M narrative-grounded dialogues, ~210M tokens), for ~4 epochs under [Muon](https://kellerjordan.github.io/posts/muon/) + a warmup-stable-decay schedule | Wants a GPU: ~24h. No pretrained weights anywhere. |
 | `gpt2` | GPT-2 (124M) fine-tuned on dialogue data | Opt-in: never started automatically |
 
 Select with `--backend` (CLI) or `SODACHAT_BACKEND` (Discord / Google Chat).
 Other datasets: `--dataset dailydialog`, or `--dataset nps` (char-level) for
 vintage 2006 chat-room flavor.
 
-**Why SODA and not something smaller.** A 14M-param model needs roughly 20
-tokens per parameter ([Chinchilla](https://arxiv.org/abs/2203.15556)) — about
-280M tokens. DailyDialog supplies 1.5M, i.e. **0.1 tokens/param, ~200× too
-few**. That deficit is what "grammatical but irrelevant" actually looks like:
+**Why SODA and not something smaller.** A 14M-param model needs *at minimum*
+roughly 20 tokens per parameter ([Chinchilla](https://arxiv.org/abs/2203.15556))
+— about 280M tokens. DailyDialog supplies 1.5M, i.e. **0.1 tokens/param, ~200×
+too few**. That deficit is what "grammatical but irrelevant" actually looks like:
 [TinyStories](https://arxiv.org/abs/2305.07759) found grammar saturates early
 and cheaply, while *using the context* is the last ability to emerge and is
-the most data-hungry. SODA's ~210M tokens put this model near the optimal
-ratio, and its dialogues are grounded in a narrative, so turns actually
-respond to each other.
+the most data-hungry. SODA's ~210M tokens clear that bar in a single pass, and
+its dialogues are grounded in a narrative, so turns actually respond to each
+other.
+
+The default schedule then runs **~4 epochs** of it, ~60 tokens/param. Chinchilla
+is a *training*-compute-optimal ratio — it answers "best loss per GPU-hour
+spent training", which is the wrong question for a model that gets trained once
+and then run forever. Repeating a corpus up to ~4 times is worth nearly as much
+as fresh data ([Muennighoff et al.](https://arxiv.org/abs/2305.16264)), so the
+extra epochs cost wall-clock and nothing else. Use `--steps` to trade quality
+back for time.
 
 **Expectations:** short, mostly grammatical small talk that generally tracks
 the topic. It is not an instruction-following assistant — it cannot do
@@ -100,7 +109,7 @@ Hugging Face hub, NPS Chat via NLTK (`pip install nltk`, only needed for
 ## Training
 
 ```sh
-.venv/bin/python -m sodachat.train                    # mini-GPT on SODA (~6h on a GPU)
+.venv/bin/python -m sodachat.train                    # mini-GPT on SODA (~24h on a GPU)
 .venv/bin/python -m sodachat.train --dataset dailydialog   # small/fast, lower quality
 .venv/bin/python -m sodachat.finetune                 # GPT-2 (needs >=16GB / GPU)
 ```
@@ -237,6 +246,87 @@ curl -s -X POST localhost:8080/ -H 'Content-Type: application/json' \
 curl -s -X POST localhost:8080/ -H 'Content-Type: application/json' \
   -d '{"type":"MESSAGE","message":{"text":"write me a python function that sorts a list"}}'
 ```
+
+## In the browser (ONNX Runtime Web)
+
+The models also run **client-side**, with no Python and no server round-trip:
+export the graphs to ONNX, and [onnxruntime-web](https://onnxruntime.ai/docs/tutorials/web/)
+runs them in the page. After the download, the tab works with the network off.
+
+```sh
+pip install onnx onnxruntime onnxscript   # export-time only
+npm install && npm run vendor             # onnxruntime-web -> web/vendor/
+
+python -m sodachat.export_onnx            # checkpoints -> web/models/*.onnx
+python -m sodachat.web --open             # http://127.0.0.1:8000
+```
+
+Every model in [the map](sodachat/__init__.py) that has a text head is exported,
+and the page offers a panel per capability — chat, a specialist's classifier,
+a specialist's generator, and Snake played through the action head:
+
+| Graph | Params | fp32 | What the page does with it |
+|---|---|---|---|
+| `chat.onnx` | 13.7M | 55 MB | the `mini` chat model, with MMI reranking |
+| `expert-text.onnx` | 30.8M | 124 MB | the expert's chat/read expert |
+| `expert-game.onnx` | 30.8M | 124 MB | board → move off the action head |
+| `expert-route.onnx` | 30.8M | 124 MB | which capability should answer |
+| `expert-code.onnx` | 30.8M | 124 MB | language ID off a 6-way head |
+| `expert-vision.onnx` | 30.8M | 124 MB | 20-way image label |
+| `expert-codegen.onnx` | 30.8M | 124 MB | code continuation |
+| `expert-reason.onnx` | 30.8M | 124 MB | step-by-step, then an answer |
+
+Export a subset when you don't want all of it — `--models chat`, or
+`--tasks text,route` — and `--quantize int8` cuts each file to roughly a
+quarter at some quality cost. The chat UI needs only `chat.onnx`.
+
+**Why the graphs look the way they do.** Three things had to change on the way
+out, all of them forced by the browser, and all explained at the top of
+[export_onnx.py](sodachat/export_onnx.py):
+
+- **A KV cache.** `MiniGPT.generate` re-runs the whole context per token, which
+  is fine on a GPU and hopeless in WASM — a reply is 12 candidates × 48 tokens,
+  and at ~3 GFLOP per uncached pass that is minutes of arithmetic. The exported
+  graphs take the attention cache in and hand it back grown, so a token costs
+  ~30 MFLOP. The prompt is identical across a reply's 12 candidates, so the
+  engine prefills once and *forks* that cache per candidate.
+- **Explicit attention.** `F.scaled_dot_product_attention` has no counterpart in
+  the ORT web build, so the export spells it out as matmul/softmax.
+- **One graph per task, not one routed graph.** `RoutedFFN` picks an expert per
+  token, but at inference a whole sequence carries one task — so each graph is
+  exported with a single expert's weights baked in. Fusing all seven would put
+  117M params of experts in every download to use 17M of them.
+
+**The browser half is a port, not a wrapper.** `web/js/` re-implements the
+byte-level BPE tokenizer, the sampler (`blocks.warp_logits`), the MMI ranking
+(`engine.py`), and Snake's board — because none of that lives in the ONNX graph.
+A port that is *nearly* right is a model being fed prompts it never trained on,
+so the agreement is tested rather than assumed:
+
+```sh
+python -m sodachat.export_onnx           # --check: graphs vs PyTorch, on by default
+python tools/dump_tokenizer_cases.py && npm run check:tokenizer
+python tools/dump_engine_cases.py  && npm run check:model
+```
+
+which covers, respectively: every exported graph against the module it came
+from (max |Δlogit| ~2e-5, prefill *and* single-token steps off a cache);
+44 encode/decode cases against the Python tokenizer; and the JavaScript against
+PyTorch end to end — greedy ids exactly, log-probs, classifier confidences and
+action-head moves to within fp32 noise.
+
+```
+chat: done                    expert-route: done
+expert-text: done             expert-code: done
+expert-game: done
+chat reply: "Not much, just went to school and then came home." (rel 0.50, 11 candidates)
+expert-text reply: "Not much, just hung out at home." (rel 1.02, 11 candidates)
+26/26 checks pass
+```
+
+`sodachat.web` is a static file server and nothing else — it sends the COOP/COEP
+headers that let onnxruntime-web use threads, and the right MIME type for
+`.wasm`. WebGPU is used where the browser has it, falling back to WASM.
 
 ## Playing games
 
@@ -932,8 +1022,11 @@ data/training/inference lives in its own file below.
 sodachat/
   corpus.py       # load + clean the NPS Chat corpus
   data.py         # dialogue dataset loaders (SODA, DailyDialog, NPS)
-  blocks.py       # SHARED toolkit: RMSNorm/RoPE/attention/SwiGLU/Block, GPTConfig,
-                  #   tokenizers, pick_device, pad_load — every model builds on these
+  blocks.py       # SHARED toolkit: RMSNorm/RoPE/QK-norm/attention/SwiGLU/ReLU2MLP/
+                  #   Block, GPTConfig, tokenizers, pick_device, pad_load — every
+                  #   model builds on these
+  optim.py        # SHARED training toolkit: Muon, the Muon/AdamW parameter split,
+                  #   the warmup-stable-decay schedule
   model.py        # base decoder LM (MiniGPT) + chat model (MiniChatLM) + checkpoint I/O
   train.py        # chat-model training -> models/minigpt-soda.pt
   unified.py      # one 30M dense model on the whole mixture -> models/unified.pt
@@ -954,6 +1047,8 @@ sodachat/
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/
   engine.py       # chat generation + MMI relevance reranking
   cli.py          # terminal chat UI (rich)
+  export_onnx.py  # export the models to ONNX for the browser -> web/models/
+  web.py          # static server for web/ (COOP/COEP, wasm MIME types)
   rooms.py        # shared chat-room plumbing: one agent per room over one set of
                   #   models, attachment staging, code fencing, message splitting
   discord_bot.py  # Discord chat frontend (discord.py), running the full agent
@@ -966,4 +1061,19 @@ sodachat/
   games/          # pluggable games: core framework + snake/pong/dodge/tictactoe
                   #   + sandbox (a no-train VLA test grid)
                   #   + versus (multiplayer snake: you vs. the bot, reusing the solo model)
+
+web/              # the browser frontend — static, no build step
+  index.html      #   chat / classify / generate / play panels
+  js/tokenizer.js #   byte-level BPE, ported from blocks.BPETokenizer
+  js/model.js     #   ONNX session: KV cache, sampling, log-probs, heads
+  js/engine.js    #   the chat engine — candidates + MMI ranking (engine.py)
+  js/snake.js     #   Snake, ported from games/snake.py, for the action head
+  js/app.js       #   page wiring; picks panels from the manifest's `kind`
+  models/         #   generated by export_onnx.py (gitignored)
+  vendor/ort/     #   onnxruntime-web, copied in by `npm run vendor` (gitignored)
+
+tools/            # build + parity checks for the above
+  vendor_ort.mjs        # copy onnxruntime-web out of node_modules
+  dump_tokenizer_cases.py / check_tokenizer.mjs   # JS tokenizer == Python
+  dump_engine_cases.py   / check_web_engine.mjs   # JS runtime  == PyTorch
 ```

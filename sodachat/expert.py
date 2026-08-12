@@ -41,9 +41,10 @@ from .blocks import (
     CausalSelfAttention,
     GPTConfig,
     RMSNorm,
-    SwiGLU,
     _rope_cache,
+    config_from_payload,
     make_amp,
+    make_mlp,
     pick_device,
     tokenizer_from_payload,
     warp_logits,
@@ -82,12 +83,12 @@ def default_goal(game_name: str) -> str:
 
 
 class RoutedFFN(nn.Module):
-    """One SwiGLU per task; each token uses only its task's expert (so compute
+    """One feed-forward per task; each token uses only its task's expert (so compute
     per token is a single FFN — same FLOPs as a dense model, more capacity)."""
 
     def __init__(self, cfg: GPTConfig, n_experts: int = N_EXPERTS):
         super().__init__()
-        self.experts = nn.ModuleList(SwiGLU(cfg) for _ in range(n_experts))
+        self.experts = nn.ModuleList(make_mlp(cfg) for _ in range(n_experts))
 
     def forward(self, x: torch.Tensor, task: torch.Tensor) -> torch.Tensor:
         out = torch.zeros_like(x)
@@ -229,7 +230,7 @@ class ExpertGPT(nn.Module):
         optionally seeded from an existing expert's weights. Returns its task id."""
         device = self.tok_emb.weight.device
         for block in self.blocks:
-            expert = SwiGLU(self.cfg).to(device)
+            expert = make_mlp(self.cfg).to(device)
             if seed_from is not None:
                 expert.load_state_dict(block.ffn.experts[seed_from].state_dict())
             block.ffn.experts.append(expert)
@@ -569,8 +570,8 @@ def train(base=BASE_PATH, out=DEFAULT_PATH, steps=8000, batch_size=24, lr=2e-4,
     tok = tokenizer_from_payload(ck["tokenizer"])
     old_v = len(tok)
     new_v = tok.add_special([ACT])
-    cfg = GPTConfig(**{**ck["config"], "vocab_size": new_v,
-                       "block_size": block_size, "dropout": 0.0})
+    cfg = config_from_payload(ck["config"], vocab_size=new_v,
+                              block_size=block_size, dropout=0.0)
     model = ExpertGPT.from_minigpt(ck["state_dict"], cfg, n_actions=len(ACTION_VOCAB)).to(device)
     log(f"warm-start from {base.name}: {model._warmstart} | vocab {old_v} -> {new_v} | "
         f"block {ck['config']['block_size']} -> {block_size} | "
@@ -640,7 +641,7 @@ def save(path, model: ExpertGPT, tok, steps, val_lm, val_act, val_acc) -> None:
 def load(path=DEFAULT_PATH, device=None):
     device = device or "cpu"
     ck = torch.load(path, map_location=device, weights_only=True)
-    model = ExpertGPT(GPTConfig(**ck["config"]), ck["n_actions"],
+    model = ExpertGPT(config_from_payload(ck["config"]), ck["n_actions"],
                       ck.get("n_experts", N_EXPERTS))
     model.load_state_dict(ck["state_dict"])
     model.to(device).eval()

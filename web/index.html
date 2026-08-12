@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sodachat — in the browser</title>
+    <link rel="stylesheet" href="css/app.css" />
+  </head>
+  <body>
+    <header>
+      <h1>sodachat <span class="sub">running in your browser</span></h1>
+      <p class="blurb">
+        The same models the terminal and Discord frontends use, exported to ONNX and run
+        client-side by onnxruntime-web. Nothing you type leaves the page — after the model
+        downloads, this works with the network off.
+      </p>
+    </header>
+
+    <section class="panel" id="loader">
+      <div class="row">
+        <label for="model">Model</label>
+        <select id="model"></select>
+        <button id="load" type="button">Load</button>
+        <span class="hint" id="backend-hint"></span>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <div class="bar"><span id="bar"></span></div>
+        <span class="status" id="progress-text"></span>
+      </div>
+      <p class="status" id="status">Pick a model and press Load.</p>
+    </section>
+
+    <main hidden id="workspace">
+      <nav class="tabs" id="tabs"></nav>
+
+      <section class="panel tab" data-tab="chat">
+        <div id="transcript" class="transcript"></div>
+        <form id="chat-form" class="row">
+          <input id="message" type="text" autocomplete="off" placeholder="say something" />
+          <button id="send" type="submit">Send</button>
+        </form>
+        <p class="hint">
+          A reply is 12 sampled candidates ranked by MMI relevance — the same engine as
+          <code>engine.py</code>, so it is slower than one greedy pass and much less generic.
+        </p>
+      </section>
+
+      <section class="panel tab" data-tab="classify" hidden>
+        <p class="hint" id="classify-hint"></p>
+        <textarea id="classify-input" rows="6" placeholder="text to classify"></textarea>
+        <div class="row">
+          <button id="classify-run" type="button">Classify</button>
+          <span id="classify-out" class="result"></span>
+        </div>
+      </section>
+
+      <section class="panel tab" data-tab="generate" hidden>
+        <p class="hint" id="generate-hint"></p>
+        <div class="row" id="generate-lang-row" hidden>
+          <label for="generate-lang">Language</label>
+          <select id="generate-lang"></select>
+        </div>
+        <textarea id="generate-input" rows="4" placeholder="prompt"></textarea>
+        <div class="row">
+          <button id="generate-run" type="button">Generate</button>
+          <span class="status" id="generate-status"></span>
+        </div>
+        <pre id="generate-out" class="result block"></pre>
+      </section>
+
+      <section class="panel tab" data-tab="play" hidden>
+        <p class="hint">
+          The action head picks a move from the board in a single forward pass — no search,
+          no sampling. The board is the same 20&times;20 ASCII grid it trained on.
+        </p>
+        <div class="row">
+          <button id="play-toggle" type="button">Play</button>
+          <button id="play-step" type="button">Step</button>
+          <button id="play-reset" type="button">Reset</button>
+          <span class="result" id="play-status"></span>
+        </div>
+        <pre id="board" class="board"></pre>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Built by <code>python -m sodachat.export_onnx</code>. Graph, tokenizer and sampling
+        are checked against PyTorch by <code>tools/check_web_engine.mjs</code>.
+      </p>
+    </footer>
+
+    <script type="module" src="js/app.js"></script>
+  </body>
+</html>

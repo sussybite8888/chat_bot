@@ -5,11 +5,18 @@
 Dialogues are rendered as tagged turns (see data.py), tokenized once into a
 flat uint16 file under models/, and trained on as random crops of that token
 stream. Keeping tokens on disk rather than in RAM is what makes the ~200M-token
-SODA corpus trainable on modest hardware.
+SODA corpus trainable on modest hardware. A crop almost always straddles a
+dialogue boundary, so each token is tagged with the dialogue it came from and
+attention is masked to it (see `_batch`).
 
-The default (soda) is ~200M tokens for a ~14M-param model — roughly the
-Chinchilla-optimal ratio. DailyDialog alone is ~1.5M tokens, which leaves a
-model this size badly under-fed: fluent, but with nothing to say.
+The default (soda) schedule is ~4 epochs of the corpus — about 820M tokens for
+a ~14M-param model, ~60 tokens/param. That is deliberately far past the
+Chinchilla ratio of ~15: Chinchilla answers "best loss per unit of *training*
+compute", which is the wrong question for a model that gets trained once and
+then run forever. Repeating a corpus up to ~4 times is worth nearly as much as
+fresh data (Muennighoff et al. 2023), so the extra epochs cost wall-clock and
+nothing else. DailyDialog alone is ~1.5M tokens, which leaves a model this size
+badly under-fed: fluent, but with nothing to say.
 """
 
 from __future__ import annotations
@@ -40,18 +47,20 @@ from .data import (
 )
 from .blocks import BPETokenizer, CharTokenizer, GPTConfig, make_amp, pick_device
 from .model import MiniGPT, default_model_path, save_checkpoint
+from .optim import MUON_LR, build_optimizers, lr_multiplier, set_lr
 
-# Model size and schedule per dataset. Dropout only earns its keep when the
-# model sees the data many times; at ~1 epoch over SODA there is nothing to
-# memorize, so it is off there.
+# Model size and schedule per dataset. Dropout earns its keep once the model
+# sees the data more than once, which the ~4-epoch soda schedule now does.
 _DATASET_PRESETS: dict[str, dict] = {
-    # ~205M tokens seen ≈ 1 epoch ≈ 15 tokens/param — near Chinchilla-optimal.
-    # Wants a real GPU (~6h, ~3GB VRAM at bs=32); pass --batch-size 16 on a
-    # memory-tight machine.
+    # ~820M tokens seen ≈ 4 epochs ≈ 60 tokens/param (see the module docstring
+    # on why this is well past Chinchilla). Wants a real GPU (~24h, ~3GB VRAM
+    # at bs=32); pass --batch-size 16 on a memory-tight machine, or --steps to
+    # cut it short — but note that a WSD run stopped early never reaches its
+    # decay phase, so prefer lowering --steps over killing the run.
     "soda": {
         "tokenizer": "bpe", "vocab_size": 8000,
-        "n_layer": 6, "n_head": 6, "n_embd": 384, "dropout": 0.0,
-        "steps": 25000, "batch_size": 32, "bpe_sample": 60000,
+        "n_layer": 6, "n_head": 6, "n_embd": 384, "dropout": 0.1,
+        "steps": 100000, "batch_size": 32, "bpe_sample": 60000,
     },
     "dailydialog": {
         "tokenizer": "bpe", "vocab_size": 8000,
@@ -165,28 +174,65 @@ def _load_tokenizer(path: Path, meta: dict):
 
 
 def _batch(
-    data: np.ndarray, block_size: int, batch_size: int, device: str
-) -> tuple[torch.Tensor, torch.Tensor]:
+    data: np.ndarray,
+    block_size: int,
+    batch_size: int,
+    device: str,
+    sep_id: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """One batch of (inputs, targets, document ids).
+
+    Windows are random crops of a stream of packed dialogues, so a window
+    nearly always contains the tail of one conversation and the head of the
+    next. Given `sep_id` (the id of DIALOG_SEP) each token is numbered with the
+    dialogue it belongs to, which lets the model mask attention to a single
+    conversation instead of learning to ignore the previous one. Without it
+    the returned document ids are None and attention stays plainly causal.
+    """
     ix = np.random.randint(0, len(data) - block_size - 1, size=batch_size)
-    x = np.stack([data[i : i + block_size] for i in ix]).astype(np.int64)
-    y = np.stack([data[i + 1 : i + block_size + 1] for i in ix]).astype(np.int64)
-    xt, yt = torch.from_numpy(x), torch.from_numpy(y)
-    if device == "cuda":  # overlap the host->device copy with compute
-        return xt.pin_memory().to(device, non_blocking=True), yt.pin_memory().to(
-            device, non_blocking=True
-        )
-    return xt.to(device), yt.to(device)
+    # Read block_size + 1 tokens so inputs and targets are two views of one
+    # window — and so a target's document id is known even at the last position.
+    window = np.stack([data[i : i + block_size + 1] for i in ix]).astype(np.int64)
+    w = torch.from_numpy(window)
+    xt, yt = w[:, :-1].contiguous(), w[:, 1:].contiguous()
+
+    doc = None
+    if sep_id is not None:
+        sep = (w == sep_id).long()
+        # Inclusive cumsum numbers each dialogue; subtracting `sep` puts the
+        # separator itself in the dialogue it closes, so the model still learns
+        # to *emit* it at the end of a conversation.
+        ids = sep.cumsum(1) - sep
+        doc = ids[:, :-1].contiguous()
+        # Drop the loss wherever the target belongs to the next dialogue. That
+        # is exactly one position per boundary — the separator, whose "next
+        # token" is the opening of an unrelated conversation and unpredictable
+        # by construction. It is also the only target that would cross the
+        # boundary the attention mask just closed.
+        yt = yt.masked_fill(ids[:, 1:] != doc, -100)
+
+    def to_device(t: torch.Tensor) -> torch.Tensor:
+        if device == "cuda":  # overlap the host->device copy with compute
+            return t.pin_memory().to(device, non_blocking=True)
+        return t.to(device)
+
+    return to_device(xt), to_device(yt), None if doc is None else to_device(doc)
 
 
 @torch.no_grad()
 def _eval_loss(
-    model: MiniGPT, data: np.ndarray, block_size: int, device: str, iters: int = 40
+    model: MiniGPT,
+    data: np.ndarray,
+    block_size: int,
+    device: str,
+    sep_id: int | None = None,
+    iters: int = 40,
 ) -> float:
     model.eval()
     losses = []
     for _ in range(iters):
-        x, y = _batch(data, block_size, 16, device)
-        _, loss = model(x, y)
+        x, y, doc = _batch(data, block_size, 16, device, sep_id)
+        _, loss = model(x, y, doc_ids=doc)
         losses.append(loss.item())
     model.train()
     if device == "mps":
@@ -200,6 +246,9 @@ def train_model(
     steps: int | None = None,
     batch_size: int | None = None,
     lr: float = 3e-4,
+    muon_lr: float = MUON_LR,
+    optimizer: str = "muon",
+    schedule: str = "wsd",
     device: str | None = None,
     seed: int = 1337,
     log: Callable[[str], None] = print,
@@ -236,45 +285,61 @@ def train_model(
     log(
         f"schedule: {steps:,} steps x {batch_size} x {cfg.block_size} = "
         f"{seen/1e6:.0f}M tokens seen (~{seen/max(len(train_data),1):.1f} epochs) | "
-        f"{len(train_data)/model.num_params():.1f} tokens/param"
+        f"{seen/model.num_params():.1f} tokens/param | "
+        f"arch: {cfg.mlp}, qk_norm={cfg.qk_norm}, softcap={cfg.logit_softcap:g}"
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.95)
+    # Muon for the hidden matrices, AdamW for embeddings and norms — see
+    # optim.py for why the split is required rather than merely tidy. The
+    # cosine schedule and the single-AdamW path are kept behind flags so a
+    # change can be bisected against the old recipe.
+    optimizers = build_optimizers(
+        model, lr=lr, muon_lr=muon_lr, weight_decay=0.01, use_muon=optimizer == "muon"
     )
-    warmup = min(500, steps // 20)
-    sched = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        [
-            torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=0.1, total_iters=max(warmup, 1)
-            ),
-            torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(steps - warmup, 1), eta_min=lr * 0.1
-            ),
-        ],
-        milestones=[max(warmup, 1)],
+    warmup = min(1000, max(steps // 20, 1))
+    min_frac = 0.0 if schedule == "wsd" else 0.1
+    amp = make_amp(device)
+    log(
+        f"optimizer: {optimizer} "
+        + (f"(muon lr {muon_lr:g} / adamw lr {lr:g})" if optimizer == "muon"
+           else f"(lr {lr:g})")
+        + f" | schedule: {schedule}, {warmup} warmup steps | {amp.tag}"
     )
+
+    # The separator's token id turns on intra-dialogue attention masking; char
+    # and legacy tokenizers have no such token, so they keep plain causal
+    # attention.
+    try:
+        sep_id = tokenizer.token_id(DIALOG_SEP)
+    except (AttributeError, KeyError):
+        sep_id = None
+        log("note: tokenizer has no separator token — training without "
+            "dialogue-boundary masking")
 
     eval_every = max(250, steps // 40)
-    amp = make_amp(device)
     model.train()
     started = time.time()
     best_val = float("inf")
     for step in range(1, steps + 1):
-        x, y = _batch(train_data, cfg.block_size, batch_size, device)
+        set_lr(
+            optimizers,
+            lr_multiplier(
+                step - 1, steps, warmup=warmup, schedule=schedule, min_frac=min_frac
+            ),
+        )
+        x, y, doc = _batch(train_data, cfg.block_size, batch_size, device, sep_id)
         with amp.autocast():
-            _, loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
+            _, loss = model(x, y, doc_ids=doc)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         amp.backward(loss)
-        amp.step(optimizer, model)
-        sched.step()
+        amp.step(optimizers, model)
 
         if device == "mps" and step % 100 == 0:
             torch.mps.empty_cache()
 
         if step % eval_every == 0 or step == steps:
-            val_loss = _eval_loss(model, val_data, cfg.block_size, device)
+            val_loss = _eval_loss(model, val_data, cfg.block_size, device, sep_id)
             marker = ""
             if val_loss < best_val:  # keep only the best-generalizing weights
                 best_val = val_loss
@@ -299,7 +364,12 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="AdamW rate, for embeddings and norms")
+    parser.add_argument("--muon-lr", type=float, default=MUON_LR,
+                        help="Muon rate, for the hidden matrices")
+    parser.add_argument("--optimizer", choices=("muon", "adamw"), default="muon")
+    parser.add_argument("--schedule", choices=("wsd", "cosine"), default="wsd")
     parser.add_argument("--device", default=None, help="cuda, mps, or cpu")
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=1337)
@@ -310,6 +380,9 @@ def main() -> None:
         steps=args.steps,
         batch_size=args.batch_size,
         lr=args.lr,
+        muon_lr=args.muon_lr,
+        optimizer=args.optimizer,
+        schedule=args.schedule,
         device=args.device,
         seed=args.seed,
     )

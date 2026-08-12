@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blocks import GPTConfig, make_amp, pick_device
+from .blocks import GPTConfig, config_from_payload, make_amp, pick_device
 from .model import MiniGPT
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "models" / "reader.pt"
@@ -206,7 +206,7 @@ class Reader:
             torch.set_num_threads(1)
         ckpt = torch.load(path, map_location=device, weights_only=True)
         self.tok = CharTok(ckpt["charset"])
-        self.model = MiniGPT(GPTConfig(**ckpt["config"]))
+        self.model = MiniGPT(config_from_payload(ckpt["config"]))
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.to(device).eval()
         self.device = device

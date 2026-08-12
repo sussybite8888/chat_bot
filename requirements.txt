@@ -14,3 +14,10 @@ python-dotenv>=1.0
 
 # Optional: verify Google Chat request identity (recommended in production)
 # google-auth>=2.30
+
+# Optional: export the models to ONNX for the browser frontend
+# (python -m sodachat.export_onnx). Export-time only — sodachat.web serves
+# static files and the models then run in the page, not here.
+# onnx>=1.17
+# onnxruntime>=1.20
+# onnxscript>=0.1

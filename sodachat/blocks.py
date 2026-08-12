@@ -6,8 +6,9 @@ sodachat's models reuse. Nothing here is specific to chatting, reading, or
 playing — those live in the per-model files (see the MODEL MAP in
 `sodachat/__init__.py`).
 
-    building blocks   RMSNorm, RoPE, CausalSelfAttention, SwiGLU, Block
-    config            GPTConfig
+    building blocks   RMSNorm, RoPE, QK-norm, CausalSelfAttention,
+                      SwiGLU / ReLU2MLP (make_mlp), Block
+    config            GPTConfig, config_from_payload
     tokenizers        CharTokenizer, BPETokenizer, tokenizer_from_payload
     utilities         pick_device, pad_load
 
@@ -69,15 +70,22 @@ class _Amp:
         (self.scaler.scale(loss) if self.scaler else loss).backward()
 
     def step(self, optimizer, model=None, grad_clip: float = 1.0):
+        # `optimizer` may be one optimizer or several stepped together (the
+        # Muon/AdamW split in optim.py). Clipping happens once, between
+        # unscaling and the steps, so every optimizer sees the same gradients.
+        optimizers = optimizer if isinstance(optimizer, (list, tuple)) else [optimizer]
         if self.scaler is not None:
-            self.scaler.unscale_(optimizer)
+            for opt in optimizers:
+                self.scaler.unscale_(opt)
         if grad_clip and model is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        for opt in optimizers:
+            if self.scaler is not None:
+                self.scaler.step(opt)
+            else:
+                opt.step()
         if self.scaler is not None:
-            self.scaler.step(optimizer)
             self.scaler.update()
-        else:
-            optimizer.step()
 
     @property
     def tag(self) -> str:
@@ -158,6 +166,30 @@ class GPTConfig:
     n_embd: int = 192
     dropout: float = 0.1
     rope_theta: float = 10000.0
+    # Architecture options. The defaults are the current ones; a checkpoint
+    # trained before an option existed gets the old behaviour back through
+    # `config_from_payload`, so old weights keep loading and running exactly
+    # as they were trained.
+    qk_norm: bool = True
+    mlp: str = "relu2"  # "relu2" | "swiglu"
+    logit_softcap: float = 15.0  # 0 disables
+
+
+# What each option meant before it existed. Every checkpoint written by an
+# older version of this package describes the architecture below.
+LEGACY_CONFIG = {"qk_norm": False, "mlp": "swiglu", "logit_softcap": 0.0}
+
+
+def config_from_payload(payload: dict, **overrides) -> GPTConfig:
+    """Rebuild the config a checkpoint was trained with.
+
+    Always use this instead of `GPTConfig(**ckpt["config"])`: a saved config
+    only carries the fields that existed when it was written, and the dataclass
+    defaults are *today's* architecture. Missing fields therefore have to fall
+    back to `LEGACY_CONFIG`, not to the defaults, or an old checkpoint would be
+    loaded into a model shaped differently from the one that produced it.
+    """
+    return GPTConfig(**{**LEGACY_CONFIG, **payload, **overrides})
 
 
 # ------------------------------------------------------------- tokenizers
@@ -285,6 +317,20 @@ def _rope_cache(
     return angles.cos().to(dtype), angles.sin().to(dtype)
 
 
+def rms_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """RMS normalization with no learned gain — the QK-norm of nanochat and
+    modded-nanogpt.
+
+    Deliberately parameter-free. A learned per-dimension gain applied to a
+    query or key would scale RoPE's dimension pairs unevenly, and attention
+    scores would stop depending only on *relative* position — the one property
+    RoPE exists to provide. With no gain, normalizing and rotating commute and
+    the question of which order to apply them in goes away.
+    """
+    scale = x.float().pow(2).mean(-1, keepdim=True).add(eps).rsqrt()
+    return (x.float() * scale).type_as(x)
+
+
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     # x: (B, n_head, T, head_dim) — rotate each (even, odd) dimension pair by a
     # position-dependent angle, so attention sees *relative* distance.
@@ -303,19 +349,34 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
         self.attn_dropout = cfg.dropout
         self.resid_drop = nn.Dropout(cfg.dropout)
+        # QK-norm: normalize each query and key vector to unit RMS before the
+        # dot product, so attention logits can no longer be driven off by a
+        # query or key that has simply grown large. Without it the softmax
+        # saturates onto one position early in training and the head stops
+        # exploring; with it the learning rate can go higher safely.
+        self.qk_norm = cfg.qk_norm
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         shape = (B, T, self.n_head, self.head_dim)
         q, k, v = (t.view(shape).transpose(1, 2) for t in (q, k, v))
+        if self.qk_norm:
+            q, k = rms_normalize(q), rms_normalize(k)
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(
             q, k, v,
+            attn_mask=attn_mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=True,
+            # A mask already carries the causal structure (see MiniGPT._doc_mask);
+            # SDPA rejects being given both.
+            is_causal=attn_mask is None,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
@@ -338,18 +399,54 @@ class SwiGLU(nn.Module):
         return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
 
 
+class ReLU2MLP(nn.Module):
+    """Ungated feed-forward with a squared-ReLU nonlinearity — what nanochat
+    and the nanoGPT speedrun use in place of SwiGLU.
+
+    Two matrices at 4x width rather than SwiGLU's three at 8/3x: at any n_embd
+    the parameter count is identical (3 * 8/3 == 2 * 4), so this trades one of
+    the three matmuls for a cheaper elementwise nonlinearity at equal capacity.
+    Squaring keeps the gate-like behaviour that makes SwiGLU work — small
+    activations are suppressed, large ones amplified — without the gate matrix.
+    """
+
+    def __init__(self, cfg: GPTConfig):
+        super().__init__()
+        hidden = 4 * cfg.n_embd
+        self.up = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.n_embd, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.down(F.relu(self.up(x)).square()))
+
+
+def make_mlp(cfg: GPTConfig) -> nn.Module:
+    """The feed-forward this config asks for. Both options name their output
+    projection `down`, which is what the zero-init rule in MiniGPT keys on."""
+    if cfg.mlp == "relu2":
+        return ReLU2MLP(cfg)
+    if cfg.mlp == "swiglu":
+        return SwiGLU(cfg)
+    raise ValueError(f"unknown mlp {cfg.mlp!r} (expected relu2 or swiglu)")
+
+
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.ln1 = RMSNorm(cfg.n_embd)
         self.attn = CausalSelfAttention(cfg)
         self.ln2 = RMSNorm(cfg.n_embd)
-        self.mlp = SwiGLU(cfg)
+        self.mlp = make_mlp(cfg)
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin)
+        x = x + self.attn(self.ln1(x), cos, sin, attn_mask)
         return x + self.mlp(self.ln2(x))
 
 

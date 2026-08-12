@@ -5,8 +5,11 @@ MODEL MAP — every model, where its parts live, and its checkpoint
 ================================================================
 
 Shared foundation (owned by no single model):
-    blocks.py   building blocks (RMSNorm, RoPE, attention, SwiGLU, Block),
-                GPTConfig, the tokenizers, pick_device, pad_load
+    blocks.py   building blocks (RMSNorm, RoPE, QK-norm, attention, SwiGLU /
+                ReLU2MLP, Block), GPTConfig, the tokenizers, pick_device,
+                pad_load
+    optim.py    the training-loop toolkit: Muon, the Muon/AdamW parameter
+                split, and the warmup-stable-decay schedule
     model.py    MiniGPT — the base decoder LM every text model reuses
 
 Each model = an architecture + its data/training/inference, in one file:
@@ -39,6 +42,11 @@ the routing specialist (route.py). Frontends: cli.py (plain terminal chat),
 agent.py's own terminal loop, and the chat rooms — discord_bot.py and
 google_chat.py, which run the full agent over the shared plumbing in rooms.py
 (one agent per room, one copy of the models).
+
+There is also a browser frontend, which runs the models *client-side* rather
+than calling into this package at all: export_onnx.py writes each model above
+to ONNX, web.py serves the static page in web/, and web/js/ re-implements the
+tokenizer, sampling and reranking against onnxruntime-web (see the README).
 """
 
 from .engine import ChatEngine, Reply

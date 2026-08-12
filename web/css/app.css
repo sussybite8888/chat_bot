@@ -1,0 +1,241 @@
+/* Deliberately plain: no build step, no framework, one stylesheet. */
+
+:root {
+  --bg: #11131a;
+  --panel: #181b24;
+  --line: #262b38;
+  --text: #e6e8ee;
+  --dim: #98a0b3;
+  --accent: #7cc4ff;
+  --bot: #d8b4fe;
+  --ok: #86efac;
+  --warn: #fca5a5;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fb;
+    --panel: #ffffff;
+    --line: #e3e6ee;
+    --text: #1a1d26;
+    --dim: #5d6678;
+    --accent: #1d6fb8;
+    --bot: #7c3aed;
+    --ok: #157f3d;
+    --warn: #b91c1c;
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0 auto;
+  padding: 2rem 1.25rem 4rem;
+  max-width: 52rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.6rem;
+  letter-spacing: -0.01em;
+}
+
+h1 .sub {
+  color: var(--dim);
+  font-size: 1rem;
+  font-weight: 400;
+}
+
+.blurb {
+  color: var(--dim);
+  max-width: 44rem;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+
+.row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+label {
+  color: var(--dim);
+}
+
+select,
+input[type="text"],
+textarea,
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0.5rem 0.7rem;
+}
+
+textarea {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  resize: vertical;
+}
+
+input[type="text"] {
+  flex: 1;
+  min-width: 12rem;
+}
+
+button {
+  cursor: pointer;
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+  border-color: var(--line);
+  color: var(--dim);
+}
+
+.tabs {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+
+.tabs button {
+  border-color: var(--line);
+  color: var(--dim);
+  font-weight: 500;
+}
+
+.tabs button[aria-selected="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.hint,
+.status {
+  color: var(--dim);
+  font-size: 0.88rem;
+}
+
+.result {
+  font-size: 0.9rem;
+}
+
+.result.block {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0.75rem;
+  margin: 0.75rem 0 0;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  min-height: 2rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-height: 12rem;
+  max-height: 26rem;
+  overflow-y: auto;
+  margin-bottom: 0.9rem;
+}
+
+.turn {
+  max-width: 85%;
+  padding: 0.45rem 0.7rem;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+}
+
+.turn.you {
+  align-self: flex-end;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+.turn.bot {
+  align-self: flex-start;
+}
+
+.turn .who {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+}
+
+.turn.bot .who {
+  color: var(--bot);
+}
+
+.turn .meta {
+  color: var(--dim);
+  font-size: 0.75rem;
+}
+
+.progress .bar {
+  display: block;
+  height: 6px;
+  background: var(--line);
+  border-radius: 99px;
+  overflow: hidden;
+  margin: 0.5rem 0 0.35rem;
+}
+
+.progress .bar span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+
+.board {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.15;
+  letter-spacing: 0.22em;
+  margin: 0.9rem 0 0;
+  overflow-x: auto;
+}
+
+footer {
+  color: var(--dim);
+  font-size: 0.85rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.9rem;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+}

@@ -217,7 +217,7 @@ def post_train(base=BASE_PATH, out=OUT_PATH, n_instruct=150_000, n_game=160_000,
     import numpy as np
     import torch
 
-    from .blocks import GPTConfig, make_amp, pad_load, pick_device, tokenizer_from_payload
+    from .blocks import config_from_payload, make_amp, pad_load, pick_device, tokenizer_from_payload
     from .model import MiniGPT
 
     device = device or pick_device()
@@ -228,7 +228,7 @@ def post_train(base=BASE_PATH, out=OUT_PATH, n_instruct=150_000, n_game=160_000,
     tok = tokenizer_from_payload(ck["tokenizer"])
     old_v = ck["config"]["vocab_size"]
     new_v = tok.add_special([ACT])
-    cfg = GPTConfig(**{**ck["config"], "vocab_size": new_v})
+    cfg = config_from_payload(ck["config"], vocab_size=new_v)
     model = MiniGPT(cfg).to(device)
     stats = pad_load(model, ck["state_dict"])
     log(f"pad-loaded base: {stats} | vocab {old_v} -> {new_v} | "
