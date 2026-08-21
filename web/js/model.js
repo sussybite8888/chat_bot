@@ -72,10 +72,10 @@ export class OnnxLM {
     const spec = manifest.models[name];
     if (!spec) throw new Error(`${name} is not in the manifest`);
     const [graph, tokenizerJson] = await Promise.all([
-      fetchWithProgress(`${baseUrl}/${spec.file}`, spec.bytes, onProgress),
+      fetchModel(baseUrl, spec, onProgress),
       fetch(`${baseUrl}/${spec.tokenizer}`).then((r) => r.text()),
     ]);
-    const session = await ort().InferenceSession.create(new Uint8Array(graph), {
+    const session = await ort().InferenceSession.create(graph, {
       executionProviders: providers ?? ["wasm"],
       graphOptimizationLevel: "all",
       // Errors only. Otherwise every load reports, as a console *error*, that
@@ -343,26 +343,50 @@ function nthLargest(values, k) {
   return heap[0];
 }
 
-async function fetchWithProgress(url, expected, onProgress) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${url}: ${response.status} ${response.statusText}`);
-  const total = Number(response.headers.get("content-length")) || expected || 0;
-  if (!onProgress || !response.body) return response.arrayBuffer();
-  const chunks = [];
+/**
+ * Download a model's graph as one `Uint8Array`.
+ *
+ * A model is either a single `.onnx` or, when `tools/build_dist.mjs` has split
+ * it, an ordered list of `chunks` that concatenate back into exactly that file
+ * — static hosts cap individual files (Cloudflare Pages at 25 MiB), and a 124MB
+ * graph has to arrive in pieces. Either way the bytes land in one buffer sized
+ * up front from the manifest, so nothing is copied twice on the way in.
+ */
+async function fetchModel(baseUrl, spec, onProgress) {
+  const parts = spec.chunks?.length ? spec.chunks : [spec.file];
+  const total = spec.bytes ?? 0;
+  const buffer = new Uint8Array(total);
   let loaded = 0;
-  const reader = response.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    loaded += value.length;
-    onProgress(loaded, total);
+  const write = (bytes) => {
+    // Overrunning would throw a bare RangeError out of `set`; say what it means.
+    if (loaded + bytes.length > total) {
+      throw new Error(`${spec.file}: parts are longer than the manifest's ${total} bytes`);
+    }
+    buffer.set(bytes, loaded);
+    loaded += bytes.length;
+    onProgress?.(loaded, total);
+  };
+  for (const part of parts) {
+    const url = `${baseUrl}/${part}`;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${url}: ${response.status} ${response.statusText}`);
+    if (!response.body) {
+      write(new Uint8Array(await response.arrayBuffer())); // no streaming available
+      continue;
+    }
+    const reader = response.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      write(value);
+    }
   }
-  const buffer = new Uint8Array(loaded);
-  let at = 0;
-  for (const chunk of chunks) {
-    buffer.set(chunk, at);
-    at += chunk.length;
+  // A missing or truncated chunk otherwise reaches onnxruntime as a corrupt
+  // protobuf, which it reports as a parse error a long way from the cause.
+  if (loaded !== total) {
+    throw new Error(
+      `${spec.file}: expected ${total} bytes across ${parts.length} part(s), got ${loaded}`,
+    );
   }
-  return buffer.buffer;
+  return buffer;
 }

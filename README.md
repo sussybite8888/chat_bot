@@ -346,6 +346,57 @@ expert-vision   webgpu · 4 threads     Classify → airplane · 70.3% confident
 headers that let onnxruntime-web use threads, and the right MIME type for
 `.wasm`. WebGPU is used where the browser has it, falling back to WASM.
 
+### Deploying it
+
+`npm run build` packages `web/` into `dist/`, ready to upload anywhere that
+serves static files:
+
+```sh
+npm run build                        # dist/, models split at 25MB
+npm run build -- --models chat       # ship one model instead of all eight
+npm run build -- --chunk-size 90MB   # a host with a larger cap
+npm run build -- --no-chunk          # leave the .onnx files whole
+
+python -m sodachat.web --root dist   # serve the build locally
+```
+
+**Models are split, because hosts cap file size** — Cloudflare Pages at 25 MiB,
+which every expert graph is five times over. Each `.onnx` becomes numbered
+`.partNNN` files listed in the manifest, and `fetchModel` in
+[model.js](web/js/model.js) streams them back into one buffer sized from the
+manifest up front. It is the *same bytes*, not an approximation:
+
+```
+  chat               55.2 MB  3 parts        largest part: 25,000,000 bytes
+  expert-text       124.0 MB  5 parts        sha256 of the parts, concatenated,
+  expert-game       124.0 MB  5 parts        equals the original .onnx for all 8
+  ...
+  52 files, 948.4 MB total
+```
+
+A missing or truncated part would otherwise reach onnxruntime as a corrupt
+protobuf and be reported as a parse error far from the cause, so the loader
+checks the total first and says what it found:
+
+```
+Could not load chat: chat.onnx: expected 55232197 bytes across 2 part(s), got 50000000
+```
+
+The build also writes a `_headers` file (read by Cloudflare Pages and Netlify,
+ignored elsewhere) carrying the same COOP/COEP that `sodachat.web` sends, plus
+per-file immutable caching for the chunks and the WASM runtime. Those two
+headers are worth keeping: without cross-origin isolation the browser withholds
+`SharedArrayBuffer`, onnxruntime-web drops to one thread, and the page is
+several times slower with nothing on screen to explain why. On a host that
+cannot set headers at all (GitHub Pages), it still works — single-threaded.
+
+Verify a build the same way as the dev tree, by pointing the browser check at it:
+
+```sh
+python -m sodachat.web --root dist --port 8736 &
+SODACHAT_URL=http://127.0.0.1:8736/ npm run check:browser
+```
+
 ## Playing games
 
 The same architecture, small enough to decide a move in real time, also works as
@@ -1092,6 +1143,7 @@ web/              # the browser frontend — static, no build step
 
 tools/            # build + parity checks for the above
   vendor_ort.mjs        # copy onnxruntime-web out of node_modules
+  build_dist.mjs        # package web/ -> dist/, splitting models to fit host caps
   dump_tokenizer_cases.py / check_tokenizer.mjs   # JS tokenizer == Python
   dump_engine_cases.py   / check_web_engine.mjs   # JS runtime  == PyTorch
   check_browser.mjs     # the page in a real Chrome (optional, skips if absent)

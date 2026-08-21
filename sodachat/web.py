@@ -23,9 +23,14 @@ import argparse
 import functools
 import http.server
 import json
+import re
 import socketserver
 import webbrowser
 from pathlib import Path
+
+# Content that only changes when you re-export or rebuild: a whole model, one
+# chunk of a split one (`chat.onnx.part000`), or the WASM runtime.
+_IMMUTABLE_RE = re.compile(r"\.(?:onnx|wasm)$|\.onnx\.part\d+$")
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
 
@@ -50,7 +55,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Only the big opaque blobs are immutable. The manifest and the
         # tokenizer sit beside them and are rewritten by every re-export, so
         # caching those hard would pin the page to a stale model.
-        immutable = self.path.endswith((".onnx", ".wasm"))
+        # `.partNNN` is a chunked model from tools/build_dist.mjs — the largest
+        # files served here, and the ones most worth not fetching twice.
+        immutable = bool(_IMMUTABLE_RE.search(self.path))
         self.send_header(
             "Cache-Control",
             "public, max-age=31536000, immutable" if immutable else "no-cache",

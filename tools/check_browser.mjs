@@ -45,7 +45,12 @@ if (!executablePath) skip("no Chrome found (set $CHROME_PATH)");
 
 const manifest = await fetch(new URL("models/manifest.json", URL_BASE))
   .then((r) => r.json())
-  .catch(() => skip(`nothing serving ${URL_BASE} (python -m sodachat.web --port 8733)`));
+  .catch(() =>
+    skip(
+      `nothing serving ${URL_BASE} — start one with \`python -m sodachat.web --port 8733\`` +
+        " (or point $SODACHAT_URL at a running server, e.g. a built dist/)",
+    ),
+  );
 
 const wanted = process.argv.slice(2);
 const models = wanted.length ? wanted : Object.keys(manifest.models);
@@ -82,6 +87,10 @@ for (const model of models) {
     console.log(`${model.padEnd(15)} ${backend.padEnd(22)} ${tabs.join("/")} → ${result}`);
   } catch (error) {
     problems.push(error.message);
+    // The page reports load failures into #status rather than throwing, so a
+    // bare "waiting failed" is usually hiding a perfectly clear explanation.
+    const status = await page.$eval("#status", (e) => e.textContent).catch(() => null);
+    if (status) problems.push(`page status: ${status.trim()}`);
   }
   await page.close();
   if (problems.length) {

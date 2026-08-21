@@ -7,3 +7,4 @@ bot_token
 web/models/
 web/vendor/
 node_modules/
+dist/

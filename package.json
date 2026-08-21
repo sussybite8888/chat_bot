@@ -5,6 +5,7 @@
   "description": "Browser backend for sodachat: onnxruntime-web running the exported models.",
   "scripts": {
     "vendor": "node tools/vendor_ort.mjs",
+    "build": "node tools/build_dist.mjs",
     "check:tokenizer": "node tools/check_tokenizer.mjs",
     "check:model": "node tools/check_web_engine.mjs",
     "check:browser": "node tools/check_browser.mjs"
