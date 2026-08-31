@@ -12,6 +12,10 @@ the model trains on:
 The speaker tags teach the model that turns alternate and which side it is
 answering as; the separator marks where a conversation ends, so the model
 does not learn that abruptly switching topic is a valid reply.
+
+`format_document` is the same idea for plain prose — your own files from
+`data/` (see localdata.py), which have no turns to tag but still end at the
+separator so each one is a document of its own.
 """
 
 from __future__ import annotations
@@ -43,6 +47,19 @@ def format_dialogue(utterances: list[str]) -> str:
         f"{SPEAKERS[i % 2]}: {utterance}" for i, utterance in enumerate(utterances)
     ]
     return "\n".join(lines) + f"\n{DIALOG_SEP}\n"
+
+
+def format_document(text: str) -> str:
+    """Render one plaintext document (a file from `data/`, see localdata.py) as
+    training text.
+
+    Prose has no speaker tags — it is not a dialogue, and labelling it `A:`
+    would teach the model that monologue is a turn. It still ends with the
+    dialogue separator, because that token is what `train._batch` counts to
+    number documents: terminating a file with it keeps the attention mask from
+    spilling one document into the next, exactly as it does for a conversation.
+    """
+    return text.strip() + f"\n{DIALOG_SEP}\n"
 
 
 def dailydialog_dialogues(split: str) -> list[list[str]]:

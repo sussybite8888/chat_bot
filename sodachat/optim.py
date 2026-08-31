@@ -32,7 +32,14 @@ import torch.nn as nn
 # lr 0.0015 / 0.0025 / 0.005 / 0.0075 / 0.02 / 0.04 — a flat optimum around
 # 0.0025 and clearly worse by 0.02. The optimum is only weakly constrained by
 # a run that short, so re-sweep before committing to a long one.
-MUON_LR = 0.0025
+#
+# Re-swept 2026-08-29 for the 768-dim / bs=40 soda preset, 600 steps each on
+# an RTX 4000 Ada: val 2.169 / 2.157 / 2.149 / 2.154 at lr 0.0025 / 0.005 /
+# 0.01 / 0.02. The optimum moved up 4x from the 384-dim figure, landing between
+# it and the nanoGPT 768-dim value — as the note above predicts, width is what
+# moves it. Flat between 0.005 and 0.02, so this is a shallow optimum and 600
+# steps still only weakly constrains it; re-sweep again if the width changes.
+MUON_LR = 0.01
 MUON_MOMENTUM = 0.95
 MUON_NS_STEPS = 5
 

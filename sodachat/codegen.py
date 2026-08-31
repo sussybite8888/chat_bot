@@ -41,7 +41,10 @@ real code model. Saved as `specialist-codegen.pt`; `ExpertLM` grafts it on at
 startup alongside the classifier and the vision specialist.
 
 Corpus: [CodeSearchNet](https://huggingface.co/datasets/code_search_net), the
-same six languages code.py classifies (python, java, javascript, php, ruby, go).
+same six languages code.py classifies (python, java, javascript, php, ruby, go),
+plus two optional local corpora mixed in when present — the blob built by
+tools/build_codegen_corpus.py, and any source files you drop in `data/`
+(localdata.py). Both go through the same language headers and filters.
 
     python -m sodachat.codegen train     # needs models/expert.pt (train it first)
     python -m sodachat.codegen eval       # held-out perplexity
@@ -71,6 +74,7 @@ from .expert import (
     scaffold_specialist,
     specialist_param_groups,
 )
+from .localdata import CODE_EXTS, DATA_DIR, code_docs
 
 NAME = "codegen"
 DEFAULT_PATH = _MODELS / "specialist-codegen.pt"
@@ -98,10 +102,9 @@ COMMENT = {"python": "#", "ruby": "#", "javascript": "//", "typescript": "//",
 # Local-corpus extensions, mapped onto the languages this specialist writes.
 # Anything not listed here (.c/.h/.cpp/.rs/.lua ...) is dropped: C was 68% of
 # the local blob by bytes, and untagged C in a six-language stream is where JS
-# completions picked up `#endif` and template syntax.
-LOCAL_EXTS = {".py": "python", ".js": "javascript", ".mjs": "javascript",
-              ".jsx": "javascript", ".ts": "typescript", ".go": "go",
-              ".rb": "ruby", ".php": "php", ".java": "java"}
+# completions picked up `#endif` and template syntax. Shared with `data/`
+# (localdata.py) so both local corpora admit exactly the same languages.
+LOCAL_EXTS = CODE_EXTS
 
 # Machine-generated JavaScript — minifier, bundler, transpiler and obfuscator
 # output. It is syntactically valid and licence-clean, so nothing upstream
@@ -210,6 +213,30 @@ def _local_chunks(path, rng: np.random.Generator, holdout: float = 0.08, log=Non
     return tagged[n_val:], tagged[:n_val]
 
 
+def _data_chunks(rng: np.random.Generator, root=DATA_DIR, holdout: float = 0.08,
+                 log=None):
+    """Whatever source files you dropped in `data/`, split into (train, val)
+    lists tagged and filtered exactly like the blob corpus above.
+
+    This is the hand-curated path: no builder to run and no licence survey —
+    the files are yours. `localdata` decides what counts as code (the same
+    extension table this module writes, `LOCAL_EXTS`); the machine-generated
+    filter still applies, because a minified vendor file dropped in `data/`
+    would teach mangled names just as effectively as one found by the crawler.
+    """
+    docs = code_docs(root, log=log)
+    if not docs:
+        return [], []
+    kept = [_tag(d.lang, d.text) for d in docs
+            if not _machine_generated(d.text, d.lang)]
+    if log and len(kept) < len(docs):
+        log(f"  {Path(root).name}/: dropped {len(docs) - len(kept)} of "
+            f"{len(docs)} machine-generated files")
+    rng.shuffle(kept)
+    n_val = max(1, int(len(kept) * holdout)) if len(kept) > 1 else 0
+    return kept[n_val:], kept[:n_val]
+
+
 def _encode_stream(tok, texts: list[str], rng: np.random.Generator) -> np.ndarray:
     """Pack a list of code chunks into one token stream, each terminated with
     `<|end|>` so the model learns where a unit of code stops."""
@@ -287,10 +314,15 @@ def train(base=EXPERT_PATH, out=DEFAULT_PATH, steps=3000, batch_size=24, lr=3e-4
     if local_train:
         log(f"+ local permissive corpus: {len(local_train):,} train / "
             f"{len(local_val):,} val files from {LOCAL_PATH.name}")
-    else:
-        log(f"no local corpus at {LOCAL_PATH} — CodeSearchNet only")
-    train_stream = _encode_stream(tok, csn_train + local_train, rng)
-    val_stream = _encode_stream(tok, csn_val + local_val, rng)
+    data_train, data_val = _data_chunks(rng, log=log)
+    if data_train:
+        log(f"+ {DATA_DIR.name}/: {len(data_train):,} train / "
+            f"{len(data_val):,} val files")
+    if not local_train and not data_train:
+        log(f"no local corpus at {LOCAL_PATH} and no code in {DATA_DIR}/ "
+            "— CodeSearchNet only")
+    train_stream = _encode_stream(tok, csn_train + local_train + data_train, rng)
+    val_stream = _encode_stream(tok, csn_val + local_val + data_val, rng)
     seen = steps * batch_size * block
     log(f"stream: {len(train_stream) / 1e6:.2f}M train / {len(val_stream) / 1e3:.0f}k "
         f"val tokens (block {block}) | schedule: {steps:,} steps x {batch_size} x "

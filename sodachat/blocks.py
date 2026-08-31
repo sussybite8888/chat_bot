@@ -339,6 +339,38 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
+class KVCache:
+    """Per-layer key/value cache for incremental decoding.
+
+    Without one, sampling N tokens re-runs the whole forward pass over the
+    whole context N times; with one, the prompt is encoded once and each new
+    token only ever computes its own row. What is stored is *post*-RoPE and
+    post-QK-norm keys — exactly the tensors that go into the dot product — so
+    a cached key never has to be re-rotated. That works because RoPE encodes
+    absolute position at write time and attention reads out the difference:
+    as long as every new token is rotated at its own absolute index (see
+    `MiniGPT._rope_for`'s `offset`), relative distances stay correct.
+    """
+
+    def __init__(self, n_layer: int):
+        self.k: list[torch.Tensor | None] = [None] * n_layer
+        self.v: list[torch.Tensor | None] = [None] * n_layer
+
+    @property
+    def n_past(self) -> int:
+        """How many positions are already cached (0 before the prefill)."""
+        return 0 if self.k[0] is None else self.k[0].shape[-2]
+
+    def update(self, layer: int, k: torch.Tensor,
+               v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append this step's keys/values for `layer` and return the full run."""
+        if self.k[layer] is not None:
+            k = torch.cat([self.k[layer], k], dim=-2)
+            v = torch.cat([self.v[layer], v], dim=-2)
+        self.k[layer], self.v[layer] = k, v
+        return k, v
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -362,6 +394,8 @@ class CausalSelfAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache: "KVCache | None" = None,
+        layer: int = 0,
     ) -> torch.Tensor:
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
@@ -370,13 +404,28 @@ class CausalSelfAttention(nn.Module):
         if self.qk_norm:
             q, k = rms_normalize(q), rms_normalize(k)
         q, k = _apply_rope(q, cos, sin), _apply_rope(k, cos, sin)
+        if cache is not None:
+            # Store the rotated, normalized keys: what the dot product consumes.
+            k, v = cache.update(layer, k, v)
+        S = k.shape[-2]
+        if attn_mask is None and S != T:
+            # Keys reach further back than queries. SDPA's `is_causal` aligns
+            # its triangle top-left, which is only correct when the two lengths
+            # match — with a warm cache it would mask off the very history the
+            # cache exists to keep. One query against a full cache needs no mask
+            # (every cached key precedes it); a longer window needs the triangle
+            # aligned bottom-right, built here.
+            if T > 1:
+                q_pos = torch.arange(S - T, S, device=x.device)
+                k_pos = torch.arange(S, device=x.device)
+                attn_mask = (k_pos[None, :] <= q_pos[:, None])[None, None]
         y = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
             # A mask already carries the causal structure (see MiniGPT._doc_mask);
             # SDPA rejects being given both.
-            is_causal=attn_mask is None,
+            is_causal=attn_mask is None and S == T,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
@@ -445,8 +494,10 @@ class Block(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache: "KVCache | None" = None,
+        layer: int = 0,
     ) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin, attn_mask)
+        x = x + self.attn(self.ln1(x), cos, sin, attn_mask, cache=cache, layer=layer)
         return x + self.mlp(self.ln2(x))
 
 

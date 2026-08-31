@@ -36,6 +36,7 @@ from .blocks import (  # noqa: F401
     BPETokenizer,
     CharTokenizer,
     GPTConfig,
+    KVCache,
     RMSNorm,
     _rope_cache,
     config_from_payload,
@@ -124,19 +125,27 @@ class MiniGPT(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def _rope_for(self, T: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rope_for(self, T: int, device, dtype, offset: int = 0
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotation factors for `T` positions starting at absolute `offset`.
+
+        `offset` is what makes a KV cache correct: token number `n` must be
+        rotated by its own absolute angle whether it arrived in a full prompt
+        or alone as the next step, or the relative distances attention reads
+        out would not line up with the cached keys."""
         key = (device, dtype)
         cached = self._rope.get(key)
-        if cached is None or cached[0].shape[0] < T:
+        need = offset + T
+        if cached is None or cached[0].shape[0] < need:
             cached = _rope_cache(
-                max(T, self.cfg.block_size),
+                max(need, self.cfg.block_size),
                 self.cfg.n_embd // self.cfg.n_head,
                 self.cfg.rope_theta,
                 device,
                 dtype,
             )
             self._rope[key] = cached
-        return cached[0][:T], cached[1][:T]
+        return cached[0][offset:need], cached[1][offset:need]
 
     @staticmethod
     def _doc_mask(doc_ids: torch.Tensor, T: int) -> torch.Tensor:
@@ -159,13 +168,15 @@ class MiniGPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         doc_ids: torch.Tensor | None = None,
+        cache: KVCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         B, T = idx.shape
         x = self.drop(self.tok_emb(idx))
-        cos, sin = self._rope_for(T, x.device, x.dtype)
+        n_past = cache.n_past if cache is not None else 0
+        cos, sin = self._rope_for(T, x.device, x.dtype, offset=n_past)
         attn_mask = None if doc_ids is None else self._doc_mask(doc_ids, T)
-        for block in self.blocks:
-            x = block(x, cos, sin, attn_mask)
+        for i, block in enumerate(self.blocks):
+            x = block(x, cos, sin, attn_mask, cache=cache, layer=i)
         logits = self.head(self.ln_f(x))
         if self.cfg.logit_softcap:
             # Squash logits into (-cap, cap). A from-scratch model will happily
@@ -194,14 +205,24 @@ class MiniGPT(nn.Module):
         top_p: float | None = None,
         repetition_penalty: float = 1.0,
         stop_tokens: list[int] | None = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
+        """Sample a continuation of `idx`.
+
+        With `use_cache` the prompt is encoded once and each later token costs
+        a single-position forward rather than another pass over the whole
+        window — the same arithmetic, minus the part that was already done.
+        `use_cache=False` keeps the plain re-encode loop, which is what the
+        cached path is checked against.
+        """
         self.eval()
         stop = set(stop_tokens or ())
         start = idx.shape[1]
-        for _ in range(max_new_tokens):
-            ctx = idx[:, -self.cfg.block_size :]
-            logits, _ = self(ctx)
-            logits = warp_logits(
+        window = self.cfg.block_size
+        cache = KVCache(len(self.blocks)) if use_cache else None
+        logits, _ = self(idx[:, -window:], cache=cache)
+        for step in range(max_new_tokens):
+            warped = warp_logits(
                 logits[:, -1, :],
                 idx[:, start:],  # penalize only what this call generated
                 temperature,
@@ -209,10 +230,23 @@ class MiniGPT(nn.Module):
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
             )
-            next_id = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+            next_id = torch.multinomial(F.softmax(warped, dim=-1), num_samples=1)
             if next_id.item() in stop:
                 break
             idx = torch.cat([idx, next_id], dim=1)
+            if step == max_new_tokens - 1:
+                break  # nothing would read the next logits
+            if cache is None:
+                logits, _ = self(idx[:, -window:])
+            elif cache.n_past < window:
+                logits, _ = self(next_id, cache=cache)
+            else:
+                # Window full. Re-encode the trailing `window` tokens from
+                # scratch — exactly what the uncached loop does every step —
+                # so positions restart at 0 and RoPE is never asked to
+                # extrapolate past the context the model was trained on.
+                cache = KVCache(len(self.blocks))
+                logits, _ = self(idx[:, -window:], cache=cache)
         return idx
 
 

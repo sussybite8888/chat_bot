@@ -11,6 +11,9 @@ Shared foundation (owned by no single model):
     optim.py    the training-loop toolkit: Muon, the Muon/AdamW parameter
                 split, and the warmup-stable-decay schedule
     model.py    MiniGPT — the base decoder LM every text model reuses
+    localdata.py  your own plaintext training data in data/ — prose is mixed
+                into the chat model's stream (train.py), source into the code
+                generator's corpus (codegen.py)
 
 Each model = an architecture + its data/training/inference, in one file:
 

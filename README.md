@@ -121,7 +121,37 @@ Checkpoints (`models/minigpt-soda.pt`) keep the best validation loss, with the
 BPE vocabulary stored inside.
 
 Flags: `--dataset soda|dailydialog|nps`, `--steps`, `--batch-size`, `--lr`,
-`--device`, `--out`, `--seed`.
+`--device`, `--out`, `--seed`, `--data-dir`, `--no-local-data`.
+
+### Your own training data (`data/`)
+
+Everything above trains on datasets fetched from Hugging Face. To train on your
+own files instead, drop them in [data/](data/) — plain text and source, no
+loader to write and no conversion step. The **file extension** decides which
+model a file feeds:
+
+```
+data/
+  text/     .txt .md .rst ...        -> the chat model     (sodachat.train)
+  code/     .py .js .ts .go .rb .php .java
+                                     -> the code generator (sodachat.codegen)
+```
+
+```sh
+.venv/bin/python -m sodachat.localdata          # what would be picked up, and what's skipped
+.venv/bin/python -m sodachat.train              # text files mixed into the dialogue stream
+.venv/bin/python -m sodachat.codegen train      # source files mixed into CodeSearchNet
+```
+
+Text files become untagged documents in the same token stream as the dialogues,
+each terminated by `<|endofdialog|>` so the document-boundary attention mask
+(below) keeps one file from bleeding into the next; ~8% are held out for
+validation. The tokenized cache is fingerprinted against the folder, so editing
+a file re-tokenizes on the next run rather than silently training on the old
+copy. Source files go in under the same language headers (`# python`,
+`// javascript`) and the same machine-generated-code filter as the rest of the
+codegen corpus; an extension outside the list above is skipped rather than fed
+in untagged. Details and the full skip list: [data/README.md](data/README.md).
 
 ### Training memory (read this on a laptop)
 
@@ -1090,7 +1120,10 @@ data/training/inference lives in its own file below.
 ```
 sodachat/
   corpus.py       # load + clean the NPS Chat corpus
-  data.py         # dialogue dataset loaders (SODA, DailyDialog, NPS)
+  data.py         # dialogue dataset loaders (SODA, DailyDialog, NPS) + the
+                  #   training text format (tagged turns, plain documents)
+  localdata.py    # your own plaintext data in data/: prose -> train.py,
+                  #   source -> codegen.py
   blocks.py       # SHARED toolkit: RMSNorm/RoPE/QK-norm/attention/SwiGLU/ReLU2MLP/
                   #   Block, GPTConfig, tokenizers, pick_device, pad_load — every
                   #   model builds on these
@@ -1130,6 +1163,10 @@ sodachat/
   games/          # pluggable games: core framework + snake/pong/dodge/tictactoe
                   #   + sandbox (a no-train VLA test grid)
                   #   + versus (multiplayer snake: you vs. the bot, reusing the solo model)
+
+data/             # YOUR plaintext training data (optional, see data/README.md)
+  text/           #   prose, mixed into the chat model's stream
+  code/           #   source, mixed into the code generator's corpus
 
 web/              # the browser frontend — static, no build step
   index.html      #   chat / classify / generate / play panels

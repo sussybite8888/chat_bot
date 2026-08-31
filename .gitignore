@@ -8,3 +8,4 @@ web/models/
 web/vendor/
 node_modules/
 dist/
+data/
