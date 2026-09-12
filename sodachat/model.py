@@ -204,6 +204,7 @@ class MiniGPT(nn.Module):
         top_k: int | None = 40,
         top_p: float | None = None,
         repetition_penalty: float = 1.0,
+        frequency_penalty: float = 0.0,
         stop_tokens: list[int] | None = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
@@ -229,6 +230,7 @@ class MiniGPT(nn.Module):
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
+                frequency_penalty=frequency_penalty,
             )
             next_id = torch.multinomial(F.softmax(warped, dim=-1), num_samples=1)
             if next_id.item() in stop:
@@ -299,16 +301,30 @@ _CHAT_TOP_K = 40
 _CHAT_TOP_P = 0.95
 _CHAT_REPETITION_PENALTY = 1.15
 
+# How many tokens a reply may generate before it is cut off, quoted in **subword
+# tokens** — the unit `engine.ReplyLength` speaks, and the one every chat model
+# here shares (unified.py and expert.py import it rather than repeating the
+# number). Callers override it per call via `generate_line(max_new_tokens=...)`.
+CHAT_MAX_NEW_TOKENS = 48
+# A character tokenizer spends ~2.5x as many tokens on the same words, so a
+# budget quoted in subword tokens is scaled by this before a char model uses it.
+# 48 -> 120, the pair this shipped with.
+_CHAR_TOKEN_RATIO = 2.5
+
 
 class MiniChatLM:
     """Inference wrapper around the from-scratch GPT."""
 
-    def __init__(self, path: Path = DEFAULT_MODEL_PATH, device: str | None = None):
+    def __init__(self, path: Path = DEFAULT_MODEL_PATH, device: str | None = None,
+                 max_new_tokens: int | None = None):
+        """`max_new_tokens` sets how long a reply may run, in subword tokens
+        (None = `CHAT_MAX_NEW_TOKENS`). It is the generation half of reply
+        length; the trimming half lives in `engine.ReplyLength`, which drives
+        this through `generate_line`."""
         self.model, self.tokenizer = load_checkpoint(path, device)
         self.device = next(self.model.parameters()).device
         self._newline_id = self.tokenizer.encode("\n")[0]
-        # A reply line is ~one sentence: chars need a longer budget than words.
-        self._max_new = 120 if self.tokenizer.kind == "char" else 48
+        self.max_new_tokens = self._budget(max_new_tokens)
         # Stop a reply at end-of-line or end-of-conversation, whichever comes
         # first, so the model never runs on into the next speaker's turn.
         self._stop_ids = [self._newline_id]
@@ -317,15 +333,30 @@ class MiniChatLM:
         except (AttributeError, KeyError):  # char/legacy checkpoints
             pass
 
-    def generate_line(self, prompt: str, temperature: float = 0.8) -> str:
+    def _budget(self, tokens: int | None) -> int:
+        """This model's reply budget for a length quoted in subword tokens.
+
+        Two adjustments: char tokenizers are scaled up by `_CHAR_TOKEN_RATIO`,
+        and the result is capped at half the block so that a long reply cannot
+        squeeze the conversation out of the context window — at which point the
+        model would be answering a prompt it can no longer see."""
+        n = CHAT_MAX_NEW_TOKENS if tokens is None else max(1, int(tokens))
+        if self.tokenizer.kind == "char":
+            n = round(n * _CHAR_TOKEN_RATIO)
+        return min(n, self.model.cfg.block_size // 2)
+
+    def generate_line(self, prompt: str, temperature: float = 0.8,
+                      max_new_tokens: int | None = None) -> str:
+        max_new = (self.max_new_tokens if max_new_tokens is None
+                   else self._budget(max_new_tokens))
         ids = self.tokenizer.encode(prompt) or [self._newline_id]
         # Trim old context so prompt + reply fit in the block.
-        budget = self.model.cfg.block_size - self._max_new
+        budget = self.model.cfg.block_size - max_new
         ids = ids[-budget:]
         idx = torch.tensor([ids], dtype=torch.long, device=self.device)
         out = self.model.generate(
             idx,
-            max_new_tokens=self._max_new,
+            max_new_tokens=max_new,
             temperature=temperature,
             top_k=_CHAT_TOP_K,
             top_p=_CHAT_TOP_P,

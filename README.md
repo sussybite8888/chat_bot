@@ -89,8 +89,14 @@ The engine ([engine.py](sodachat/engine.py)) wraps that with:
   with the same model). Fluent-but-generic candidates that ignore your
   message score low; the best-scoring one is returned (shown as `rel` in
   the terminal UI).
-- **Reply trimming** — generations are cut to their first sentence or two;
-  sampled tails tend to wander.
+- **Reply trimming** — generations are cut to whole sentences; sampled tails
+  tend to wander. How much is one setting, `--reply-length short|medium|long`
+  (CLI), `SODACHAT_REPLY_LENGTH` (Discord / Google Chat) or `/length` (agent
+  REPL), which moves the generation budget and the trim together — raising the
+  trim alone only re-cuts a reply the model was already stopped from finishing.
+  At `long` the trim stops being the binding constraint (2% of replies, against
+  38% at `medium`); past that the limit is the model's own turn length, since
+  SODA turns are short.
 - **Output filtering** — a profanity filter is applied to replies by default.
   Disable with `--unfiltered` (CLI) or `SODACHAT_UNFILTERED=1`.
 
@@ -184,8 +190,8 @@ nothing — on a tight machine use `--batch-size 16`.
 .venv/bin/python -m sodachat.cli --once "hey whats up" # one-shot
 ```
 
-`sodachat.cli` flags: `--backend mini|gpt2`, `--plain` (hide reply metadata),
-`--unfiltered`, `--seed N`.
+`sodachat.cli` flags: `--backend mini|gpt2`, `--reply-length short|medium|long`,
+`--plain` (hide reply metadata), `--unfiltered`, `--seed N`.
 
 ## Discord
 

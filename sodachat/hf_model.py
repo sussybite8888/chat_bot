@@ -41,12 +41,14 @@ class HFChatLM:
         self._newline_id = self.tokenizer.encode("\n")[0]
 
     @torch.no_grad()
-    def generate_line(self, prompt: str, temperature: float = 0.8) -> str:
+    def generate_line(self, prompt: str, temperature: float = 0.8,
+                      max_new_tokens: int | None = None) -> str:
         ids = self.tokenizer(prompt, return_tensors="pt").input_ids
         ids = ids[:, -_PROMPT_TOKEN_BUDGET:].to(self.device)
         out = self.model.generate(
             ids,
-            max_new_tokens=_MAX_NEW_TOKENS,
+            max_new_tokens=_MAX_NEW_TOKENS if max_new_tokens is None
+            else max(1, max_new_tokens),
             do_sample=True,
             temperature=temperature,
             top_p=0.95,

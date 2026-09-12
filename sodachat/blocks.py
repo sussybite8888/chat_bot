@@ -108,6 +108,14 @@ def make_amp(device: str, enabled: bool | None = None) -> _Amp:
     return _Amp(device, bool(enabled), dtype)
 
 
+# How far back the frequency penalty counts (see `warp_logits`). A loop lives in
+# the tail of what has been generated, so counting there makes a cycle stand out
+# sharply against ordinary repetition; counting over the whole output instead
+# would let a long, healthy chain of thought accumulate enough "the"s to be
+# penalized like a loop.
+_FREQ_WINDOW = 64
+
+
 def warp_logits(
     logits: torch.Tensor,
     seq: torch.Tensor | None,
@@ -115,25 +123,54 @@ def warp_logits(
     top_k: int | None = None,
     top_p: float | None = None,
     repetition_penalty: float = 1.0,
+    frequency_penalty: float = 0.0,
 ) -> torch.Tensor:
     """Turn raw last-position logits into a distribution ready for sampling.
 
     `logits` is (B, V) — the logits at the position being generated. `seq` is
-    (B, T), the tokens generated so far, used only by the repetition penalty.
+    (B, T), the tokens generated so far, read by the two repetition controls.
     Applied in the conventional order:
 
-    1. **Repetition penalty** (CTRL, Keskar et al. 2019): each logit for a token
+    1. **Frequency penalty**: `frequency_penalty * count` is *subtracted* from
+       each token's logit, counting occurrences over the last `_FREQ_WINDOW`
+       generated tokens. 0.0 is a no-op.
+    2. **Repetition penalty** (CTRL, Keskar et al. 2019): each logit for a token
        already in `seq` is divided by `repetition_penalty` if positive, else
        multiplied by it, so >1 discourages repeats. This is what tames the
        word-looping small models fall into; 1.0 is a no-op.
-    2. **Temperature.**
-    3. **Top-k**, then **nucleus (top-p)** — top-p keeps the smallest set of
+    3. **Temperature.**
+    4. **Top-k**, then **nucleus (top-p)** — top-p keeps the smallest set of
        most-likely tokens whose mass reaches `top_p`, a softer tail cut than a
        fixed k. Filtered entries are set to -inf; the caller softmaxes.
+
+    Why (2) is not enough on its own, and what (1) adds. The repetition penalty
+    is *presence*-based: it shaves a distinct token id once however many times
+    that id has already appeared, and `logit_softcap` bounds logits to
+    (-cap, cap), so dividing by 1.15 moves a winning logit by at most ~2 —
+    nowhere near enough to dislodge a confident cycle. A model that has fallen
+    into "...97989798..." keeps emitting it until the token budget runs out.
+
+    The frequency penalty grows with the count instead, so a cycle digs its own
+    grave: every time round, each of its ids is pushed further down. Keeping
+    the count to a window rather than the whole output is what makes that safe
+    on prose — a loop fills the window and is crushed, while an ordinary
+    frequent word appears a handful of times and is barely moved.
+
+    A no-repeat-n-gram ban was tried here first and removed: it is the usual
+    answer for this failure, but it cannot see these loops. Byte-level BPE has
+    tokens for "0", "00", "000" and "0000", so one character-level cycle is
+    spelled differently each time round and the token n-grams never match. It
+    left the digit loops untouched (8/60 -> 9/60 on the arithmetic prompts that
+    provoke them) while costing answers elsewhere.
 
     Defaults are all no-ops so callers that pass only temperature/top_k behave
     exactly as before.
     """
+    if frequency_penalty and seq is not None and seq.numel():
+        window = seq[:, -_FREQ_WINDOW:]
+        counts = torch.zeros_like(logits)
+        counts.scatter_add_(1, window, torch.ones_like(window, dtype=logits.dtype))
+        logits -= frequency_penalty * counts
     if repetition_penalty != 1.0 and seq is not None and seq.numel():
         for b in range(seq.shape[0]):
             ids = torch.unique(seq[b])

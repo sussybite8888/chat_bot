@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -39,6 +38,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from sodachat.discord_text import clean as _clean  # noqa: E402
 from sodachat.model import SPEAKERS  # noqa: E402  (needs ROOT on the path)
 
 TOKENS = ROOT / "bot_token"
@@ -240,25 +240,6 @@ def cmd_export(args) -> None:
     print(f"\nwrote {len(kept):,} messages ({humans:,} from humans) to "
           f"{shown(out)}\n  {span}")
     print(f"\nnext: python tools/export_discord.py render {shown(out)}")
-
-
-def _clean(text: str) -> str:
-    """Strip the parts of a Discord message that are markup rather than words:
-    custom emoji, raw mention ids, and the invisible bits of a link. What the
-    model should learn here is how these people talk."""
-    text = re.sub(r"<a?:(\w+):\d+>", r":\1:", text)      # <:name:123> -> :name:
-    # Padded, because a mention often abuts the next word (`<@123>how many...`)
-    # and the collapse below puts the spacing right either way.
-    text = re.sub(r"<@[!&]?\d+>", " @someone ", text)
-    text = re.sub(r"<#\d+>", " #channel ", text)
-    text = re.sub(r"\|\|(.+?)\|\|", r"\1", text, flags=re.S)   # spoiler bars
-    # A URL is a string of nothing this model can learn to produce. Markdown
-    # links keep their label -- stripping the target out of `[Teto cinema](url)`
-    # and leaving `[Teto cinema](` would teach broken syntax.
-    text = re.sub(r"\[([^\]]*)\]\(\s*<?https?://[^)]*>?\s*\)", r"\1", text)
-    text = re.sub(r"<?https?://\S+?>?(?=\s|$)", "", text)
-    text = re.sub(r"\[([^\]]*)\]\(\s*\)", r"\1", text)   # link whose target already went
-    return re.sub(r"[ \t]+", " ", text).strip()
 
 
 def sessions(messages: list[dict], gap_minutes: int) -> list[list[dict]]:

@@ -7,7 +7,7 @@ import argparse
 from rich.console import Console
 from rich.panel import Panel
 
-from .engine import BACKENDS, ChatEngine
+from .engine import BACKENDS, REPLY_LENGTHS, ChatEngine
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -31,6 +31,14 @@ def main(argv: list[str] | None = None) -> None:
         help="mini: from-scratch GPT trained on DailyDialog (default); "
         "gpt2: fine-tuned GPT-2, opt-in (needs a beefier machine to train)",
     )
+    parser.add_argument(
+        "--reply-length",
+        choices=sorted(REPLY_LENGTHS),
+        default=None,
+        help="how long replies may run (default: medium, or "
+        "SODACHAT_REPLY_LENGTH). Sets the generation budget and the "
+        "sentence/character trim together.",
+    )
     args = parser.parse_args(argv)
 
     console = Console()
@@ -39,7 +47,10 @@ def main(argv: list[str] | None = None) -> None:
         "one-time step can take a while)...[/]"
     )
     engine = ChatEngine(
-        filtered=not args.unfiltered, seed=args.seed, backend=args.backend
+        filtered=not args.unfiltered,
+        seed=args.seed,
+        backend=args.backend,
+        reply_length=args.reply_length,
     )
     history: list[str] = []
 

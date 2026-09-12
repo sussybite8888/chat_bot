@@ -135,6 +135,31 @@ MIN_THINK_CHARS = 40   # below this there is no reasoning to learn from, only a
                        # bare equation and an option letter (AQuA-RAT has these)
 MAX_Q_CHARS = 600
 MAX_ANSWER_CHARS = 120  # a "final answer" longer than this is really more steps
+# Loop breaker for decoding (see `blocks.warp_logits`). Long division, decimals
+# and percentage work are where this expert falls into a digit cycle — a tail
+# like "87456.2857149897989798979897989798..." — and once it does, the whole
+# max_new_tokens budget goes into the cycle, `<|answer|>` is never reached, and
+# the caller gets a wandering chain with an empty answer. Note it is *prompts
+# outside the training distribution* that provoke it (bare arithmetic, big
+# numbers), not the GSM8K-shaped word problems the corpus is made of, which is
+# why held-out perplexity never showed it.
+#
+# Measured over 60 such prompts (20 questions x 3 seeds) plus 120 GSM8K test
+# problems, at temperature 0.1:
+#
+#   penalty   digit loops   empty answers   GSM8K empty   GSM8K exact match
+#     0.0        9/60          28/60          20/120         3/120 (2.5%)
+#     0.35       2/60          16/60          14/120         2/120 (1.7%)
+#     0.5        1/60          15/60          15/120         2/120 (1.7%)
+#     0.7        1/60          12/60          13/120         4/120 (3.3%)
+#
+# 0.5 sits on the plateau: it takes essentially all of the loop reduction and
+# most of the recovered answers without pushing the distribution harder than it
+# has to. Exact match moves by two to four problems in either direction, which
+# at this scale is noise — the arithmetic is the frozen trunk's ceiling (see the
+# module docstring) and no sampler setting changes it. What the fix buys is that
+# a wrong answer now arrives as a wrong answer instead of a wall of digits.
+FREQUENCY_PENALTY = 0.5
 
 
 # =====================================================================
@@ -785,6 +810,7 @@ def think(lm: ExpertLM, question: str, max_new_tokens: int = 220,
     idx = lm._ids(f"{REASON} {' '.join(question.split())}\n{THINK}")
     out = lm.model.generate_text(idx, task, max_new_tokens, temperature,
                                  top_k=40, top_p=top_p, repetition_penalty=1.15,
+                                 frequency_penalty=FREQUENCY_PENALTY,
                                  stop_tokens=[end])
     ids = out[0][idx.shape[1]:].tolist()
     if end in ids:

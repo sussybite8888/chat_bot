@@ -182,11 +182,18 @@ class _ExpertPlayer:
 
 class SodaAgent:
     def __init__(self, device: str = "cpu", filtered: bool = True,
-                 shared: dict | None = None):
+                 shared: dict | None = None,
+                 reply_length: "str | None" = None):
+        from .engine import resolve_reply_length
+
         self.device = device
         # Handed to every ChatEngine this agent builds, so a frontend's
         # SODACHAT_UNFILTERED reaches the model that actually replies.
         self.filtered = filtered
+        # Same idea for how long replies may run: resolved once here (so a bad
+        # SODACHAT_REPLY_LENGTH fails at startup rather than on the first
+        # message) and handed to every engine. `/length` changes it live.
+        self.reply_length = resolve_reply_length(reply_length)
         # Loaded checkpoints live in `shared`, which several agents can be given
         # at once. A chat-room frontend runs one agent per room — each needs its
         # own history, its own game, its own "last image seen" — and must not
@@ -335,7 +342,8 @@ class SodaAgent:
         if self._shared.get("chat") is None:
             from .engine import ChatEngine
 
-            self._shared["chat"] = ChatEngine(filtered=self.filtered)
+            self._shared["chat"] = ChatEngine(filtered=self.filtered,
+                                              reply_length=self.reply_length)
         return self._shared["chat"]
 
     def _engine_for(self, lm) -> "ChatEngine":
@@ -346,7 +354,8 @@ class SodaAgent:
         path = self._mode_path()
         key = str(path) if path is not None else id(lm)
         if key not in self._engines:
-            self._engines[key] = ChatEngine(lm=lm, filtered=self.filtered)
+            self._engines[key] = ChatEngine(lm=lm, filtered=self.filtered,
+                                            reply_length=self.reply_length)
         return self._engines[key]
 
     def _mode_path(self, mode: str | None = None):
@@ -1034,6 +1043,32 @@ class SodaAgent:
         state = "steering moves" if self.goal_set else "not set (games use their natural goal)"
         return f"Current goal: {self.goal!r} ({state}). Set with /goal <instruction>."
 
+    def _cmd_length(self, arg: str) -> str:
+        """Show or set how long replies may run: `/length long`.
+
+        Applies to every engine this agent has already built, not just the next
+        one — otherwise switching length would appear to do nothing until the
+        model was switched too."""
+        from .engine import REPLY_LENGTHS, resolve_reply_length
+
+        names = " | ".join(REPLY_LENGTHS)
+        if arg.strip():
+            try:
+                self.reply_length = resolve_reply_length(arg.strip())
+            except ValueError as e:
+                return f"{e}. Usage: /length <{names}>"
+            for engine in [*self._engines.values(), self._shared.get("chat")]:
+                if engine is not None:
+                    engine.reply_length = self.reply_length
+        # A ReplyLength built by hand (constructor, not /length) has no name.
+        current = next((n for n, v in REPLY_LENGTHS.items()
+                        if v == self.reply_length), "custom")
+        L = self.reply_length
+        return (f"Reply length: {current} — up to {L.max_new_tokens} tokens, "
+                f"then trimmed to {L.max_sentences} sentence"
+                f"{'s' if L.max_sentences != 1 else ''} / ~{L.target_chars} chars. "
+                f"Set with /length <{names}>.")
+
     def _model_info(self) -> str:
         from .expert import DEFAULT_PATH as EXPERT_PATH
         from .instruct import OUT_PATH as INSTRUCT_PATH
@@ -1110,6 +1145,8 @@ _COMMANDS = {
     "model": SodaAgent._cmd_model,
     "info": SodaAgent._cmd_model,
     "goal": SodaAgent._cmd_goal,
+    "length": SodaAgent._cmd_length,
+    "len": SodaAgent._cmd_length,
     "stats": SodaAgent._cmd_stats,
     "help": SodaAgent._cmd_help,
 }
@@ -1135,6 +1172,7 @@ _HELP = [
      " am (no argument: how the last one went)"),
     ("/model", "show models, or switch: expert | specialist | unified | instruct"),
     ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
+    ("/length", "how long replies may run: short | medium | long"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),
     ("/help", "this list"),
     ("/exit", "leave"),

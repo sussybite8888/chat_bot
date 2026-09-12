@@ -49,7 +49,7 @@ from .blocks import (
     tokenizer_from_payload,
     warp_logits,
 )
-from .model import _CHAT_REPETITION_PENALTY, _CHAT_TOP_P
+from .model import _CHAT_REPETITION_PENALTY, _CHAT_TOP_P, CHAT_MAX_NEW_TOKENS
 
 TEXT, GAME = 0, 1
 N_EXPERTS = 2
@@ -173,7 +173,8 @@ class ExpertGPT(nn.Module):
 
     @torch.no_grad()
     def generate_text(self, idx, task_id, max_new_tokens, temperature=0.8,
-                      top_k=40, top_p=None, repetition_penalty=1.0, stop_tokens=()):
+                      top_k=40, top_p=None, repetition_penalty=1.0,
+                      frequency_penalty=0.0, stop_tokens=()):
         """Autoregressive text from the LM head, every token routed to `task_id`'s
         expert (TEXT for chat/read). Games don't use this — see `move_logits`."""
         stop = set(stop_tokens)
@@ -188,6 +189,7 @@ class ExpertGPT(nn.Module):
                 top_k=top_k,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
+                frequency_penalty=frequency_penalty,
             )
             probs = F.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, 1)
@@ -817,15 +819,18 @@ class ExpertLM:
         turns = [*history, message]
         lines = [f"{'AB'[(len(turns) - 1 - i) % 2]}: {t}" for i, t in enumerate(turns)]
         prompt = f"{CHAT}\n" + "\n".join(lines) + "\nB:"
-        return self._gen(prompt, TEXT, 48, temperature, top_p=_CHAT_TOP_P,
+        return self._gen(prompt, TEXT, CHAT_MAX_NEW_TOKENS, temperature,
+                         top_p=_CHAT_TOP_P,
                          repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
 
     # The ChatEngine protocol (generate_line + logprob), so the expert model can
     # be wrapped by ChatEngine and get the same MMI relevance reranking the mini
     # model does. `prompt` is a tag-less "A:…\nB:" chat frame (from build_prompt);
     # we re-tag it and route to the TEXT expert to match training data exactly.
-    def generate_line(self, prompt: str, temperature: float = 0.8) -> str:
-        return self._gen(f"{CHAT}\n" + prompt, TEXT, 48, temperature,
+    def generate_line(self, prompt: str, temperature: float = 0.8,
+                      max_new_tokens: int | None = None) -> str:
+        max_new = CHAT_MAX_NEW_TOKENS if max_new_tokens is None else max(1, max_new_tokens)
+        return self._gen(f"{CHAT}\n" + prompt, TEXT, max_new, temperature,
                          top_p=_CHAT_TOP_P,
                          repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
 

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
@@ -28,6 +27,7 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
+from .discord_text import clean_incoming
 from .engine import ChatEngine
 from .rooms import (
     DISCORD_LIMIT,
@@ -42,10 +42,6 @@ from .rooms import (
 )
 
 log = logging.getLogger("sodachat.discord")
-
-
-def _strip_mentions(content: str, bot_user: discord.ClientUser) -> str:
-    return re.sub(rf"<@!?{bot_user.id}>", "", content).strip()
 
 
 async def _stage_attachments(message: discord.Message,
@@ -158,8 +154,11 @@ def main() -> None:
         if not (is_dm or mentioned or respond_all):
             return
 
-        text = _strip_mentions(message.content, client.user)
-        log.info("recieved: ", text)
+        # Not `message.content`: Discord's raw markup carries a snowflake id
+        # for every emoji, mention and channel in the message, and the model
+        # was trained on the cleaned form (see discord_text).
+        text = clean_incoming(message.content, client.user.id)
+        log.info("received: %s", text)
         if not agent_mode:
             history = histories[message.channel.id]
             reply = engine.reply(text, history=history)
