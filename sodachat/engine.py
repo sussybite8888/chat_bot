@@ -67,7 +67,7 @@ _NUDGE_LINES = [
     "ok... use your words",
 ]
 
-_HISTORY_LINES = 8
+_HISTORY_LINES = 16
 _NUM_CANDIDATES = 12
 # Generation temperature and the MMI lambda live on the active Persona
 # (persona.py); "neutral" holds the values chat has always run with.
