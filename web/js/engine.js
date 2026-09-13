@@ -11,6 +11,8 @@
 // value there, and changing it in one place alone will make the two frontends
 // disagree about what the same model says.
 
+import { primerLines, resolvePersona, styleReply } from "./persona.js";
+
 const BLOCKLIST =
   /\b(?:fuck\w*|shit\w*|bitch\w*|cunt\w*|nigg\w*|fag\w*|cock\w*|dick\w*|pussy|horn(?:y|ie\w*)|sexy?|nude\w*|naked|porn\w*|slut\w*|whore\w*|rape\w*|penis|vagina|boob\w*|tit(?:s|ties)?)\b/i;
 
@@ -27,10 +29,10 @@ const NUDGES = [
 const MAX_REPLY_CHARS = 200;
 const HISTORY_LINES = 8;
 const NUM_CANDIDATES = 12;
-const GEN_TEMPERATURE = 0.75;
-const MMI_LAMBDA = 0.7;
 const TRIM_MAX_SENTENCES = 2;
 const TRIM_TARGET_CHARS = 100;
+// Generation temperature and the MMI lambda come from the active persona
+// (persona.js); "neutral" holds the values this engine has always used.
 
 const clean = (text) => (text || "").replace(/\s+/g, " ").trim();
 
@@ -73,11 +75,16 @@ export function nullPrompt({ bot = "B", prefix = "" } = {}) {
 }
 
 export class ChatEngine {
-  /** `lm` is an OnnxLM; `filtered` keeps the word filter on, as in Python. */
-  constructor(lm, { filtered = true, random = Math.random } = {}) {
+  /**
+   * `lm` is an OnnxLM; `filtered` keeps the word filter on, as in Python.
+   * `persona` is a name from persona.js — assign `engine.persona` to change it
+   * mid-conversation, as `/persona` does in the Python frontends.
+   */
+  constructor(lm, { filtered = true, random = Math.random, persona = undefined } = {}) {
     this.lm = lm;
     this.filtered = filtered;
     this.random = random;
+    this.persona = resolvePersona(persona);
     this.recent = [];
     this.backend = lm.spec.label ?? "onnx";
   }
@@ -91,11 +98,8 @@ export class ChatEngine {
   }
 
   _nudge() {
-    return {
-      text: NUDGES[Math.floor(this.random() * NUDGES.length)],
-      source: "canned",
-      score: 0,
-    };
+    const line = NUDGES[Math.floor(this.random() * NUDGES.length)];
+    return { text: styleReply(this.persona, line, this.random), source: "canned", score: 0 };
   }
 
   /**
@@ -113,7 +117,15 @@ export class ChatEngine {
     const lines = history.map(clean).filter(Boolean);
     // Keep whole user/bot pairs so speaker tags stay aligned.
     const kept = lines.length ? lines.slice(-(HISTORY_LINES - (HISTORY_LINES % 2))) : [];
-    const prompt = buildPrompt(kept, text, this.lm.spec.prompt);
+    // The persona's example exchange goes in front of the real history, as the
+    // oldest thing in the conversation: there is no system prompt, so the only
+    // way to tell the model how B talks is to show it B talking.
+    const persona = this.persona;
+    const prompt = buildPrompt(
+      [...primerLines(persona), ...kept],
+      text,
+      this.lm.spec.prompt,
+    );
 
     await onEvent({ stage: "prefill" });
     const prefilled = await this.lm.prefill(prompt);
@@ -121,7 +133,7 @@ export class ChatEngine {
     const candidates = [];
     for (let i = 0; i < NUM_CANDIDATES; i++) {
       const { text: raw } = await this.lm.generate(prefilled, {
-        temperature: GEN_TEMPERATURE + 0.05 * (i % 3),
+        temperature: persona.temperature + 0.05 * (i % 3),
       });
       const candidate = trimReply(raw.trim());
       if (this._acceptable(candidate, text) && !candidates.includes(candidate)) {
@@ -146,12 +158,15 @@ export class ChatEngine {
     for (const candidate of candidates) {
       const score =
         (await this.lm.logprobFrom(scoring, candidate)) -
-        MMI_LAMBDA * (await this.lm.logprobFrom(baseline, candidate));
+        persona.mmiLambda * (await this.lm.logprobFrom(baseline, candidate));
       if (!best || score > best.score) best = { text: candidate, score };
     }
 
-    this.recent.push(best.text.toLowerCase());
+    // Style last: the model can't be talked into a verbal tic, and the repeat
+    // check wants the line as it will actually be shown.
+    const styled = styleReply(persona, best.text, this.random);
+    this.recent.push(styled.toLowerCase());
     if (this.recent.length > 8) this.recent.shift();
-    return { text: best.text, source: this.backend, score: best.score, candidates };
+    return { text: styled, source: this.backend, score: best.score, candidates };
   }
 }

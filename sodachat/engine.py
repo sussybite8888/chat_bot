@@ -17,6 +17,12 @@ SODACHAT_REPLY_LENGTH): "short", "medium" (default) or "long" — see
 `ReplyLength`, which carries the generation budget and the trim caps together
 because setting one without the others does nothing.
 
+Personality (ChatEngine(persona=...), CLI --persona, SODACHAT_PERSONA, or
+`/persona` in the agent): a named `Persona` from persona.py, which primes the
+conversation with an example exchange and sets the sampling temperature, the
+MMI lambda below, and any styling of the finished reply. "neutral" (default)
+is the model as trained.
+
 Relevance comes from MMI reranking: each candidate is scored by how much the
 conversation context raises its likelihood versus no context at all,
     score = logP(reply | context) - LAMBDA * logP(reply)
@@ -37,6 +43,7 @@ from typing import Sequence
 import torch
 
 from .model import build_prompt, null_prompt
+from .persona import Persona, resolve_persona
 
 # Word filter: the training data (and anything a model can dream up from it)
 # can be crude; keep the default experience safe for public channels.
@@ -62,8 +69,8 @@ _NUDGE_LINES = [
 
 _HISTORY_LINES = 8
 _NUM_CANDIDATES = 12
-_GEN_TEMPERATURE = 0.75
-_MMI_LAMBDA = 0.7
+# Generation temperature and the MMI lambda live on the active Persona
+# (persona.py); "neutral" holds the values chat has always run with.
 
 BACKENDS = ("mini", "gpt2")
 
@@ -197,6 +204,7 @@ class ChatEngine:
         model_path: Path | None = None,
         lm=None,
         reply_length: "str | ReplyLength | None" = None,
+        persona: "str | Persona | None" = None,
     ):
         """`lm` injects a pre-built inference model (anything exposing
         `generate_line(prompt, temperature, max_new_tokens=None)` and
@@ -210,8 +218,16 @@ class ChatEngine:
         or a `ReplyLength` of your own; omitting it reads `SODACHAT_REPLY_LENGTH`
         and falls back to the default. It applies whichever way the model got
         here, injected or loaded, because the budget rides on each
-        `generate_line` call rather than on the model."""
+        `generate_line` call rather than on the model.
+
+        `persona` is a name from persona.py ("cheerful", "deadpan", ... or one
+        of your own from personas.json) or a `Persona`; omitting it reads
+        `SODACHAT_PERSONA` and falls back to "neutral", the model as trained.
+        Like `reply_length` it rides on each call, so both can be reassigned on
+        a live engine — which is how `/persona` and `/length` take effect
+        without rebuilding anything."""
         self.reply_length = resolve_reply_length(reply_length)
+        self.persona = resolve_persona(persona)
         self._filtered = filtered
         self._rng = random.Random(seed)
         if seed is not None:
@@ -239,21 +255,26 @@ class ChatEngine:
     def reply(self, message: str, history: Sequence[str] = ()) -> Reply:
         """Generate a reply. `history` is recent conversation lines (both
         sides, oldest first) used to condition the model."""
+        persona = self.persona
         text = _clean(message)
         if not _HAS_CONTENT_RE.search(text):
-            return Reply(self._rng.choice(_NUDGE_LINES), "canned", 0.0)
+            return Reply(persona.style(self._rng.choice(_NUDGE_LINES), self._rng),
+                         "canned", 0.0)
 
         lines = [_clean(h) for h in history if _clean(h)]
         # Keep whole user/bot pairs so speaker tags stay aligned.
         kept = lines[-(_HISTORY_LINES - _HISTORY_LINES % 2) :] if lines else []
-        prompt = build_prompt(kept, text)
+        # The persona's example exchange goes in front of the real history, as
+        # the oldest thing in the conversation: the model has no system prompt,
+        # so the only way to tell it how B talks is to show it B talking.
+        prompt = build_prompt(persona.primer_lines() + kept, text)
 
         candidates: list[str] = []
         for i in range(_NUM_CANDIDATES):
             candidate = _trim_reply(
                 self._lm.generate_line(
                     prompt,
-                    temperature=_GEN_TEMPERATURE + 0.05 * (i % 3),
+                    temperature=persona.temperature + 0.05 * (i % 3),
                     max_new_tokens=self.reply_length.max_new_tokens,
                 ),
                 self.reply_length,
@@ -261,7 +282,8 @@ class ChatEngine:
             if self._acceptable(candidate, text) and candidate not in candidates:
                 candidates.append(candidate)
         if not candidates:
-            return Reply(self._rng.choice(_NUDGE_LINES), "canned", 0.0)
+            return Reply(persona.style(self._rng.choice(_NUDGE_LINES), self._rng),
+                         "canned", 0.0)
 
         # MMI: prefer candidates the conversation makes likely over ones that
         # are simply likely to be said at all. Both sides are scored in the
@@ -271,10 +293,13 @@ class ChatEngine:
             (
                 candidate,
                 self._lm.logprob(prompt, candidate)
-                - _MMI_LAMBDA * self._lm.logprob(null, candidate),
+                - persona.mmi_lambda * self._lm.logprob(null, candidate),
             )
             for candidate in candidates
         ]
         best, score = max(scored, key=lambda pair: pair[1])
+        # Style last: the model can't be talked into a verbal tic, and the
+        # repeat check wants the line as it will actually be sent.
+        best = persona.style(best, self._rng)
         self._recent.append(best.lower())
         return Reply(best, self.backend, score)

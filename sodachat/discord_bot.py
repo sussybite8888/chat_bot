@@ -6,11 +6,11 @@ DISCORD_RESPOND_ALL=1 to reply to every message the bot can read.
 Runs the full agent by default ([agent.py](agent.py)), so a channel gets
 everything the terminal does: the routing specialist picks which capability
 answers each message, `/commands` work (`/play snake`, `/see`, `/gen`, `/think`,
-`/route`, `/help`), and **images or source files posted to the channel are
-handed to the vision and code specialists** — the room equivalent of dropping a
-file into the terminal. Each channel keeps its own agent (its own history, its
-own game); the models are loaded once and shared. `SODACHAT_AGENT=0` falls back
-to the plain chat engine.
+`/route`, `/persona`, `/help`), and **images or source files posted to the
+channel are handed to the vision and code specialists** — the room equivalent
+of dropping a file into the terminal. Each channel keeps its own agent (its
+own history, its own game, its own persona); the models are loaded once and
+shared. `SODACHAT_AGENT=0` falls back to the plain chat engine.
 
 Requires the *Message Content Intent* to be enabled for the bot in the
 Discord developer portal (Bot -> Privileged Gateway Intents).

@@ -14,6 +14,9 @@ Shared foundation (owned by no single model):
     localdata.py  your own plaintext training data in data/ — prose is mixed
                 into the chat model's stream (train.py), source into the code
                 generator's corpus (codegen.py)
+    persona.py  how replies *sound* — primer turns, sampling temperature, MMI
+                lambda and styling, per named personality; no retraining, and
+                your own live in personas.json
 
 Each model = an architecture + its data/training/inference, in one file:
 

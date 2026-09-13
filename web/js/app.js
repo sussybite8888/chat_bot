@@ -5,6 +5,7 @@
 // head implies (a classifier gets Classify, a generator gets Generate).
 
 import { ChatEngine } from "./engine.js";
+import { DEFAULT_PERSONA, PERSONAS, resolvePersona } from "./persona.js";
 import { OnnxLM } from "./model.js";
 import { ACTIONS, SnakeGame } from "./snake.js";
 
@@ -102,7 +103,7 @@ async function loadModel(providers) {
     `${spec.config.n_layer}L/${spec.config.n_embd}d, ${spec.config.block_size}-token context` +
     (spec.quantization !== "none" ? `, ${spec.quantization}` : "");
 
-  engine = spec.kind === "chat" ? new ChatEngine(lm) : null;
+  engine = spec.kind === "chat" ? new ChatEngine(lm, { persona: $("persona").value }) : null;
   history = [];
   buildTabs(spec);
   ui.workspace.hidden = false;
@@ -174,6 +175,29 @@ function showTab(id) {
 }
 
 // ----------------------------------------------------------------------- chat
+
+// The personality picker: the same personas the Python frontends offer, minus
+// the ones from personas.json — that file lives in the repo root, which the
+// static server doesn't serve. Populated once; a reload of the model keeps
+// whatever is selected.
+for (const persona of Object.values(PERSONAS)) {
+  const option = document.createElement("option");
+  option.value = persona.name;
+  option.textContent = `${persona.name} — ${persona.description}`;
+  option.selected = persona.name === DEFAULT_PERSONA;
+  $("persona").append(option);
+}
+
+function showPersona() {
+  const persona = resolvePersona($("persona").value);
+  $("persona-hint").textContent =
+    `temp ${persona.temperature}, mmi λ ${persona.mmiLambda}` +
+    (persona.primer.length ? `, ${persona.primer.length} primer turns` : ", no priming");
+  if (engine) engine.persona = persona;
+}
+
+$("persona").addEventListener("change", showPersona);
+showPersona();
 
 function addTurn(who, text, meta = "") {
   const turn = document.createElement("div");

@@ -44,9 +44,16 @@
           <input id="message" type="text" autocomplete="off" placeholder="say something" />
           <button id="send" type="submit">Send</button>
         </form>
+        <div class="row">
+          <label for="persona">Personality</label>
+          <select id="persona"></select>
+          <span class="hint" id="persona-hint"></span>
+        </div>
         <p class="hint">
           A reply is 12 sampled candidates ranked by MMI relevance — the same engine as
           <code>engine.py</code>, so it is slower than one greedy pass and much less generic.
+          The personality primes the conversation and moves the sampling knobs
+          (<code>persona.py</code>); it takes effect on the next message.
         </p>
       </section>
 

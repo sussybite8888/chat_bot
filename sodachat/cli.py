@@ -8,6 +8,9 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .engine import BACKENDS, REPLY_LENGTHS, ChatEngine
+from .persona import BUILT_INS as PERSONAS
+from .persona import describe as describe_personas
+from .persona import resolve_persona
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -39,9 +42,36 @@ def main(argv: list[str] | None = None) -> None:
         "SODACHAT_REPLY_LENGTH). Sets the generation budget and the "
         "sentence/character trim together.",
     )
+    parser.add_argument(
+        "--persona",
+        metavar="NAME",
+        default=None,
+        # Not `choices=`: a persona can also come from personas.json, which
+        # is read when the name is resolved rather than when --help is built.
+        help="personality of the replies: "
+        + " | ".join(PERSONAS)
+        + " (default: neutral, or SODACHAT_PERSONA). Add your own in "
+        "personas.json; switch mid-chat with /persona.",
+    )
+    parser.add_argument(
+        "--personas",
+        action="store_true",
+        help="list the available personas (including your own) and exit",
+    )
     args = parser.parse_args(argv)
 
+    try:
+        persona = resolve_persona(args.persona)
+    except ValueError as e:
+        parser.error(str(e))
+
     console = Console()
+    if args.personas:  # before the model load: this question doesn't need it
+        # markup=False: a custom persona's line carries the file it came from,
+        # and rich reads "[/path/to/personas.json]" as a closing tag.
+        console.print(describe_personas(persona), markup=False)
+        return
+
     console.print(
         "[dim]loading model (a missing model is trained on first run — that "
         "one-time step can take a while)...[/]"
@@ -51,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         backend=args.backend,
         reply_length=args.reply_length,
+        persona=persona,
     )
     history: list[str] = []
 
@@ -60,6 +91,8 @@ def main(argv: list[str] | None = None) -> None:
         line = f"[bold magenta]bot ›[/] {reply.text}"
         if not args.plain:
             meta = reply.source
+            if engine.persona.name != "neutral":
+                meta += f" · {engine.persona.name}"
             if reply.score:
                 meta += f" · rel {reply.score:.2f}"
             line += f"  [dim]({meta})[/]"
@@ -71,8 +104,10 @@ def main(argv: list[str] | None = None) -> None:
 
     console.print(
         Panel.fit(
-            f"Chatting via the [bold]{engine.backend}[/] backend.\n"
-            "Type [bold]/quit[/] (or Ctrl-D) to leave.",
+            f"Chatting via the [bold]{engine.backend}[/] backend, "
+            f"persona [bold]{engine.persona.name}[/].\n"
+            "Type [bold]/persona[/] to change how it sounds, "
+            "[bold]/quit[/] (or Ctrl-D) to leave.",
             border_style="cyan",
             title="sodachat",
         )
@@ -85,6 +120,20 @@ def main(argv: list[str] | None = None) -> None:
             break
         if message.strip().lower() in {"/quit", "/exit", "/q"}:
             break
+        # The only command plain chat has: swap the personality without
+        # restarting (the agent REPL has the full /persona, this is the same
+        # switch). Bare /persona lists what's on offer.
+        if message.strip().split(" ")[0].lower() in {"/persona", "/personality"}:
+            _, _, name = message.strip().partition(" ")
+            if name.strip():
+                try:
+                    engine.persona = resolve_persona(name.strip())
+                except ValueError as e:
+                    console.print(f"[red]{e}[/]")
+                    continue
+            console.print(describe_personas(engine.persona), markup=False,
+                          style="dim")
+            continue
         respond(message)
     console.print("[dim]bye![/]")
 

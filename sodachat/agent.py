@@ -183,8 +183,10 @@ class _ExpertPlayer:
 class SodaAgent:
     def __init__(self, device: str = "cpu", filtered: bool = True,
                  shared: dict | None = None,
-                 reply_length: "str | None" = None):
+                 reply_length: "str | None" = None,
+                 persona: "str | None" = None):
         from .engine import resolve_reply_length
+        from .persona import resolve_persona
 
         self.device = device
         # Handed to every ChatEngine this agent builds, so a frontend's
@@ -194,6 +196,11 @@ class SodaAgent:
         # SODACHAT_REPLY_LENGTH fails at startup rather than on the first
         # message) and handed to every engine. `/length` changes it live.
         self.reply_length = resolve_reply_length(reply_length)
+        # And the same again for personality — how the replies sound (primer
+        # turns, sampling temperature, styling; see persona.py). Per-agent, so
+        # one room can be deadpan while another is cheerful. `/persona` changes
+        # it live.
+        self.persona = resolve_persona(persona)
         # Loaded checkpoints live in `shared`, which several agents can be given
         # at once. A chat-room frontend runs one agent per room — each needs its
         # own history, its own game, its own "last image seen" — and must not
@@ -343,8 +350,16 @@ class SodaAgent:
             from .engine import ChatEngine
 
             self._shared["chat"] = ChatEngine(filtered=self.filtered,
-                                              reply_length=self.reply_length)
-        return self._shared["chat"]
+                                              reply_length=self.reply_length,
+                                              persona=self.persona)
+        engine = self._shared["chat"]
+        # This one engine is shared by every room in the process, while persona
+        # and reply length are per-conversation settings — so they are re-applied
+        # on each use rather than at construction, or one room's /persona would
+        # arrive in everybody else's channel.
+        engine.persona = self.persona
+        engine.reply_length = self.reply_length
+        return engine
 
     def _engine_for(self, lm) -> "ChatEngine":
         """Wrap an active LM (ExpertLM/UnifiedLM) in a ChatEngine so its chat
@@ -355,7 +370,8 @@ class SodaAgent:
         key = str(path) if path is not None else id(lm)
         if key not in self._engines:
             self._engines[key] = ChatEngine(lm=lm, filtered=self.filtered,
-                                            reply_length=self.reply_length)
+                                            reply_length=self.reply_length,
+                                            persona=self.persona)
         return self._engines[key]
 
     def _mode_path(self, mode: str | None = None):
@@ -1069,6 +1085,24 @@ class SodaAgent:
                 f"{'s' if L.max_sentences != 1 else ''} / ~{L.target_chars} chars. "
                 f"Set with /length <{names}>.")
 
+    def _cmd_persona(self, arg: str) -> str:
+        """Show or set the personality: `/persona deadpan`.
+
+        Applies to the engines this agent has already built, like `/length` —
+        the persona rides on each generation call, so nothing is reloaded."""
+        from .persona import describe, resolve_persona
+
+        if arg.strip():
+            try:
+                self.persona = resolve_persona(arg.strip())
+            except ValueError as e:
+                return f"{e}. Usage: /persona <name>"
+            # Per-agent engines only: the shared chat engine picks the persona
+            # up on use (_chat_engine), since other rooms are using it too.
+            for engine in self._engines.values():
+                engine.persona = self.persona
+        return describe(self.persona)
+
     def _model_info(self) -> str:
         from .expert import DEFAULT_PATH as EXPERT_PATH
         from .instruct import OUT_PATH as INSTRUCT_PATH
@@ -1147,6 +1181,9 @@ _COMMANDS = {
     "goal": SodaAgent._cmd_goal,
     "length": SodaAgent._cmd_length,
     "len": SodaAgent._cmd_length,
+    "persona": SodaAgent._cmd_persona,
+    "personality": SodaAgent._cmd_persona,
+    "vibe": SodaAgent._cmd_persona,
     "stats": SodaAgent._cmd_stats,
     "help": SodaAgent._cmd_help,
 }
@@ -1173,6 +1210,7 @@ _HELP = [
     ("/model", "show models, or switch: expert | specialist | unified | instruct"),
     ("/goal", "set the instruction that steers moves (expert/instruct mode)"),
     ("/length", "how long replies may run: short | medium | long"),
+    ("/persona [name]", "how the bot sounds: cheerful | deadpan | ... (no name lists)"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),
     ("/help", "this list"),
     ("/exit", "leave"),

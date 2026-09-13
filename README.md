@@ -97,6 +97,13 @@ The engine ([engine.py](sodachat/engine.py)) wraps that with:
   At `long` the trim stops being the binding constraint (2% of replies, against
   38% at `medium`); past that the limit is the model's own turn length, since
   SODA turns are short.
+- **Personality** — the model has no system prompt (it is a from-scratch
+  `A:`/`B:` dialogue LM, so "be cheerful" is not an instruction it can
+  follow), so a persona is built from the things that do reach it: a short
+  example exchange prepended to the conversation, the sampling temperature,
+  the MMI λ above, and a light post-process. `--persona` (CLI),
+  `SODACHAT_PERSONA` (Discord / Google Chat) or `/persona` (agent REPL and
+  any channel). See [Personality](#personality).
 - **Output filtering** — a profanity filter is applied to replies by default.
   Disable with `--unfiltered` (CLI) or `SODACHAT_UNFILTERED=1`.
 
@@ -191,7 +198,79 @@ nothing — on a tight machine use `--batch-size 16`.
 ```
 
 `sodachat.cli` flags: `--backend mini|gpt2`, `--reply-length short|medium|long`,
-`--plain` (hide reply metadata), `--unfiltered`, `--seed N`.
+`--persona <name>` / `--personas` (list them), `--plain` (hide reply metadata),
+`--unfiltered`, `--seed N`.
+
+## Personality
+
+How the bot *sounds* is a named persona, and changing it costs nothing —
+no retraining, no reload, no restart:
+
+```sh
+.venv/bin/python -m sodachat.cli --personas               # what's available
+.venv/bin/python -m sodachat.cli --persona deadpan        # plain chat
+.venv/bin/python -m sodachat --persona grumpy             # the agent
+```
+
+```
+/persona            # in the agent, a Discord DM or a Google Chat room: list
+/persona cheerful   # ...and switch, mid-conversation
+```
+
+In the chat frontends the starting persona is `SODACHAT_PERSONA` in `.env`;
+`/persona` then changes it per channel, so one room can be deadpan while
+another is cheerful.
+
+Built in: `neutral` (the model as trained, the default), `cheerful`,
+`deadpan`, `curious`, `grumpy`, `lowkey`.
+
+**How it works.** There is no system prompt to write a personality into — the
+chat model is a from-scratch `A:`/`B:` dialogue LM. A persona is instead four
+knobs that do reach the model ([sodachat/persona.py](sodachat/persona.py)):
+
+| knob | what it does |
+| --- | --- |
+| `primer` | an example exchange prepended to the conversation, so the model's freshest evidence of how `B` talks is `B` talking that way |
+| `temperature` | how far the sampler strays from the safe reply — deadpan low, chaos high |
+| `mmi_lambda` | the relevance/genericness trade-off in the reranker; raise it and only a reply to *this* message will do |
+| `lowercase`, `closers` | a light post-process, because a model this size cannot be talked into a verbal tic |
+
+The primer sits at the front of the prompt, which is also what gets trimmed
+first when a long conversation overflows the context window — so primers stay
+to a couple of exchanges and a persona fades rather than fights for room. It
+is deliberately kept out of the MMI null baseline (`null_prompt`), which is
+"what would this model say with no context at all"; priming both sides would
+cancel the persona back out of the score.
+
+**Writing your own.** [personas.json](personas.json) in the repo root is
+merged over the built-ins (reuse a built-in name to override it) and re-read
+when it changes, so an edit lands on the next message:
+
+```json
+{
+  "pirate": {
+    "description": "nautical, overfamiliar",
+    "primer": [
+      ["how's it going?", "ahoy! fair winds today, matey, and no complaints from me."],
+      ["i had a rough day", "arr, rough seas happen. sit ye down and tell the tale."]
+    ],
+    "temperature": 0.85,
+    "mmi_lambda": 0.7,
+    "lowercase": false,
+    "closers": [", matey.", " arr."],
+    "closer_chance": 0.3
+  }
+}
+```
+
+Only `description` is required; every other field falls back to the neutral
+default. `SODACHAT_PERSONAS` points at a different file.
+
+A caveat worth setting expectations with: this is a 14M-parameter model
+trained on SODA. A persona reliably moves tone, length and register — it will
+not turn the bot into a different character, and the further a persona is from
+the training distribution (the pirate above), the more it leans on the closers
+to do the work.
 
 ## Discord
 
@@ -213,7 +292,7 @@ every message it can read.
 **It runs the whole agent, not just chat.** A channel gets what the terminal
 gets: the [routing specialist](#a-routing-specialist-deciding-which-of-them-answers-you)
 picks which capability answers each message, and `/help`, `/play snake`,
-`/gen`, `/think`, `/route`, `/model` all work. Three things are specific to a
+`/gen`, `/think`, `/route`, `/model`, `/persona` all work. Three things are specific to a
 chat room, and live in [rooms.py](sodachat/rooms.py):
 
 * **Post an image and it gets looked at**; post a `.py`/`.js`/… and it gets
@@ -524,8 +603,10 @@ handwritten digit or a photo subject like a dog or a cat (works in any mode).
 The agent remembers what it saw, so a plain-text follow-up like *"what was in
 the picture?"* gets answered from it — the same pattern as the reader
 answering questions about the live game state — and the exchange lands in the
-chat history, so the chat model can keep talking about it. `/help` lists all
-commands. Each reply also shows its speed inline.
+chat history, so the chat model can keep talking about it. `/persona` changes
+how the bot sounds without restarting anything (see
+[Personality](#personality)). `/help` lists all commands. Each reply also shows
+its speed inline.
 
 `/model` shows the loaded models (params, architecture, training) and **switches
 which model powers the agent**, live:
@@ -1154,6 +1235,7 @@ sodachat/
   hf_model.py     # fine-tuned GPT-2 backend (opt-in)
   finetune.py     # GPT-2 fine-tuning -> models/gpt2-dailydialog/
   engine.py       # chat generation + MMI relevance reranking
+  persona.py      # named personalities: primer turns + sampling + styling
   cli.py          # terminal chat UI (rich)
   export_onnx.py  # export the models to ONNX for the browser -> web/models/
   web.py          # static server for web/ (COOP/COEP, wasm MIME types)
@@ -1169,6 +1251,8 @@ sodachat/
   games/          # pluggable games: core framework + snake/pong/dodge/tictactoe
                   #   + sandbox (a no-train VLA test grid)
                   #   + versus (multiplayer snake: you vs. the bot, reusing the solo model)
+
+personas.json     # YOUR personalities, merged over the built-in ones
 
 data/             # YOUR plaintext training data (optional, see data/README.md)
   text/           #   prose, mixed into the chat model's stream
