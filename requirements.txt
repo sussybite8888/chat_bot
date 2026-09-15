@@ -10,7 +10,13 @@ pygame-ce>=2.5
 discord.py>=2.4
 fastapi>=0.115
 uvicorn>=0.30
+httpx>=0.27
 python-dotenv>=1.0
+
+# A bot that talks to the master API server (SODACHAT_API_URL) needs only
+# httpx, python-dotenv and its transport library (discord.py, or fastapi +
+# uvicorn for the Google Chat webhook). Torch and the checkpoints live with
+# `python -m sodachat.api`, not with the bot.
 
 # Optional: verify Google Chat request identity (recommended in production)
 # google-auth>=2.30

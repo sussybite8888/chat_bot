@@ -19,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 
+from .files import REFUSED, FileAccess
 from .game_train import game_model_path
 from .games import GAMES, GamePlayer, load_model
 
@@ -184,11 +185,19 @@ class SodaAgent:
     def __init__(self, device: str = "cpu", filtered: bool = True,
                  shared: dict | None = None,
                  reply_length: "str | None" = None,
-                 persona: "str | None" = None):
+                 persona: "str | None" = None,
+                 files: "FileAccess | None" = None):
         from .engine import resolve_reply_length
         from .persona import resolve_persona
 
         self.device = device
+        # Which files this agent may open (files.py). The default reads nothing:
+        # `/see` and `/code` take a path from whoever is talking, and for every
+        # frontend but a terminal that is a stranger. A chat room gets
+        # `FileAccess.rooted(...)` — its own staged files and nothing else — and
+        # the terminal agent, whose user owns the machine, passes
+        # `FileAccess.anywhere()` explicitly.
+        self.files = files if files is not None else FileAccess.nothing()
         # Handed to every ChatEngine this agent builds, so a frontend's
         # SODACHAT_UNFILTERED reaches the model that actually replies.
         self.filtered = filtered
@@ -550,19 +559,23 @@ class SodaAgent:
         chat — routed to the code specialist (/code, or a bare .py file)."""
         return self._find_file_path(text, self._CODE_EXTS)
 
-    @staticmethod
-    def _find_file_path(text: str, exts) -> Path | None:
-        """An existing file (by extension) mentioned in the message — a drag-
+    def _find_file_path(self, text: str, exts) -> Path | None:
+        """A readable file (by extension) mentioned in the message — a drag-
         and-dropped path (the terminal pastes it quoted, spaces intact) or a
-        bare token."""
+        bare token.
+
+        A path this agent isn't allowed to open simply isn't found, and the
+        message goes on to be routed like any other: someone saying "check
+        app.py" in a channel wants chat, not a lecture about sandboxes. The
+        explicit `/see` and `/code` do say why, because there the whole message
+        was a request to read that file."""
         import re
 
         quoted = [a or b for a, b in re.findall(r"'([^']+)'|\"([^\"]+)\"", text)]
         bare = [t.strip("'\"").rstrip("?!.,") for t in text.split()]
         for cand in quoted + bare:
             if cand.lower().endswith(exts):
-                path = Path(cand).expanduser()
-                if path.exists():
+                if (path := self.files.resolve(cand)) is not None:
                     return path
         return None
 
@@ -888,6 +901,10 @@ class SodaAgent:
         the chat (no command) does the same thing."""
         raw = arg.strip()
         if not raw:
+            if self.files.restricted:
+                return ("Post an image here and I'll say what's in it (a digit, "
+                        "or a photo subject like a dog or a cat). I can only "
+                        "read files sent to me in this conversation.")
             return ("Usage: /see <image-file> — I'll say what's in it "
                     "(a digit, or a photo subject like a dog or a cat). "
                     "You can also just drop an image into the chat.")
@@ -896,9 +913,9 @@ class SodaAgent:
         # pair before treating it as a path, or the quotes become part of it.
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
             raw = raw[1:-1]
-        path = Path(raw).expanduser()
-        if not path.exists():
-            return f"No such file: {path}"
+        path = self.files.resolve(raw)
+        if path is None:
+            return REFUSED if self.files.restricted else f"No such file: {raw}"
         return self._look_at(path)
 
     def _cmd_code(self, arg: str) -> str:
@@ -907,6 +924,11 @@ class SodaAgent:
         in any mode. Dropping a source file into the chat does the same thing."""
         raw = arg.strip()
         if not raw:
+            if self.files.restricted:
+                return ("Post a source file here and I'll name its language "
+                        "(python, java, javascript, php, ruby, go) — say "
+                        "`/code complete` and I'll continue it too. I can only "
+                        "read files sent to me in this conversation.")
             return ("Usage: /code <source-file> [complete] — I'll name its "
                     "language (python, java, javascript, php, ruby, go). Add "
                     "`complete` and I'll continue it too. You can also just "
@@ -919,9 +941,9 @@ class SodaAgent:
             raw = " ".join(parts[:-1])
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
             raw = raw[1:-1]
-        path = Path(raw).expanduser()
-        if not path.exists():
-            return f"No such file: {path}"
+        path = self.files.resolve(raw)
+        if path is None:
+            return REFUSED if self.files.restricted else f"No such file: {raw}"
         flag = " complete" if want_complete else ""
         return self._read_code(path, flag)
 
@@ -1258,7 +1280,10 @@ def main() -> None:
     from rich.markup import escape
 
     console = Console()
-    agent = SodaAgent()
+    # The terminal's user owns this machine, so /see and /code work on any file
+    # they could have opened themselves. Every other frontend is remote input
+    # and gets a sandbox instead (rooms.py).
+    agent = SodaAgent(files=FileAccess.anywhere())
     console.print("[bold cyan]sodachat agent[/] — just type to chat. "
                   "Commands start with '/'; type [bold]/help[/].")
     while True:

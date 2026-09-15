@@ -4,8 +4,11 @@ A tiny GPT (~1–14M parameters), trained from scratch on your own machine, put
 to two uses that lean on its speed and small size:
 
 - **A chatbot** with a terminal UI, a Discord bot, a Google Chat app, and a
-  browser page sharing one engine — the last of those running the model
-  client-side via ONNX Runtime Web (see [In the browser](#in-the-browser-onnx-runtime-web)).
+  browser page sharing one engine. The bots share one *loaded* copy of it too,
+  through a small API server that holds the models (see
+  [One model, many bots](#one-model-many-bots)); the browser page skips the
+  server entirely and runs the model client-side via ONNX Runtime Web (see
+  [In the browser](#in-the-browser-onnx-runtime-web)).
 - **A game controller** — the same architecture, small enough to pick an
   action every frame, trained to play Snake, Pong, Dodge, and Tic-Tac-Toe. One
   agent both chats and plays (see [Playing games](#playing-games)).
@@ -272,6 +275,136 @@ not turn the bot into a different character, and the further a persona is from
 the training distribution (the pirate above), the more it leans on the closers
 to do the work.
 
+## One model, many bots
+
+Every frontend used to load its own checkpoints. Running the Discord bot and the
+Google Chat app meant **two** copies of a ~190MB model set, two warm-ups, and
+two processes holding weights for conversations that were never going to decode
+at the same instant anyway. So the models moved into a server of their own and
+the bots became clients of it:
+
+```
+    discord_bot ─┐
+    google_chat ─┼─ HTTP ─> sodachat.api ─> Rooms ─> SodaAgent per room ─> one model
+    your own    ─┘
+```
+
+Start the models:
+
+```sh
+.venv/bin/python -m sodachat.api          # http://127.0.0.1:8765
+```
+
+Then point as many bots at it as you like — one line of environment each:
+
+```sh
+export SODACHAT_API_URL=http://127.0.0.1:8765
+.venv/bin/python -m sodachat.discord_bot
+.venv/bin/python -m sodachat.google_chat
+```
+
+Measured on the training box, agent mode on CPU: the server is **881MB** RSS and
+takes ~40s to warm up; a bot alongside it is **51MB** and ready in ~8s. A second
+bot adds another 51MB instead of another copy of the models. Nothing but the
+server imports PyTorch — `sodachat.client` and `sodachat.transport` have no model
+dependency, and importing the package no longer pulls one in either.
+
+**Leave `SODACHAT_API_URL` unset and nothing changes**: the bot loads the models
+into its own process, exactly as before. That is still the right answer for one
+bot on one machine. `client.py` picks between the two and hands the frontend the
+same `reply()` either way, so neither bot has a branch for it.
+
+### What the server is
+
+`Rooms` ([rooms.py](sodachat/rooms.py)) — one `SodaAgent` per room over one copy
+of the checkpoints — behind five endpoints:
+
+| | |
+|---|---|
+| `GET /healthz` | whether the models are loaded (unauthenticated, for probes) |
+| `GET /v1/info` | device, mode, and which attachments it will accept |
+| `POST /v1/reply` | `{room, text, attachments?, reset?}` → `{text, seconds}` |
+| `GET /v1/rooms` | the live conversations |
+| `POST /v1/rooms/reset` | forget one room (or all of them) |
+
+Rooms are namespaced by the frontend that owns them — `discord:123`,
+`googlechat:spaces/AAA` — because one server now holds every bot's
+conversations, and two transports' ids are not from the same space. Each still
+gets its own history, its own running game, its own persona.
+
+Attachments ride along as base64 in the JSON: the bot downloads the file from
+its own transport, the server writes it into that room's directory and names it
+in the message, and the agent then sees exactly what a dropped file looks like in
+a terminal. Same code path as before, one machine further away.
+
+Generation stays serialized on `Rooms`' lock — one model, one decode at a time —
+so concurrent requests queue rather than contend. Four at once on CPU came back
+in 3.7/7.8/11.9/16.3s, which is four ~4s replies in a row and no failures.
+
+### What a room is allowed to read
+
+The agent reads files: `/see photo.png` classifies an image, `/code app.py` names
+a language, and a path sitting in a message is picked up and handled by what it
+*is*. In a terminal that is exactly right — the person typing owns the machine,
+and `/see ~/Desktop/cat.png` is no more access than `cat` would be.
+
+Through a bot it is not, and a *shared* server makes it worse: whoever can
+message any bot could otherwise walk the host filesystem — `/code /etc/passwd`,
+`/see ~/.ssh/...`, `/code .env complete` reading back a token — and the reply
+hands over what it found. So file access is a policy the frontend picks
+([files.py](sodachat/files.py)), not something the agent decides:
+
+| | |
+|---|---|
+| `FileAccess.nothing()` | no file is readable — **the default**, so a frontend that forgets to think about this is closed rather than open |
+| `FileAccess.rooted(dir)` | only what's under `dir`, symlinks resolved |
+| `FileAccess.anywhere()` | no restriction; passed explicitly by the terminal agent, and by nothing else |
+
+Each room gets a directory of its own and its agent is rooted there. The only
+thing ever written into it is the attachments of the message being answered, and
+they are deleted when the turn ends — so a room can read the files it just sent
+and nothing else: not another room's files, not the server's, not yours.
+`/v1/info` reports `"file_access": "per-room sandbox"`, so the other end can
+check the promise.
+
+Everything a prober would try is refused, and refused the same way — an answer
+that said "no such file" for one path and "not allowed" for another would be an
+oracle for what exists on the host:
+
+```
+/code /etc/passwd                 → I can only read files sent to me in this conversation.
+/code ~/.ssh/id_rsa               → (the same)
+/code ../../../../etc/passwd      → (the same)
+/code sodachat/api.py             → (the same)
+/see /dev/zero                    → (the same)
+/code mine.py     (just uploaded) → That's python — I'm 99% sure.
+```
+
+Checked at the policy level too: another room's directory, `..` in every
+spelling, `~`, a symlink planted inside the sandbox pointing at `/etc/hosts`, a
+directory, a device file, and hostile upload filenames (`../../../../tmp/pwned.py`
+lands as `pwned.py` inside the room and nowhere else). A bare path in ordinary
+text just isn't recognized and the message routes to chat — someone saying
+"check app.py" in a channel wants conversation, not a lecture about sandboxes.
+
+Talk to it without a bot:
+
+```sh
+curl -s localhost:8765/v1/info
+curl -s -X POST localhost:8765/v1/reply -H 'Content-Type: application/json' \
+  -d '{"room":"dev","text":"hey there"}'
+
+.venv/bin/python -m sodachat.client --room dev "write me a python function"
+.venv/bin/python -m sodachat.client --room dev --file cat.png "what is this?"
+```
+
+**Securing it.** The default bind is `127.0.0.1`, because this endpoint runs a
+model for whoever reaches it. To serve bots on other machines, set
+`SODACHAT_API_KEY` — every route but `/healthz` then requires it, as
+`X-API-Key: <key>` or `Authorization: Bearer <key>`, and the clients send it —
+and bind with `--host 0.0.0.0` (the server warns if you do the second without
+the first). Run it behind TLS if it leaves the machine.
+
 ## Discord
 
 1. Create an application at <https://discord.com/developers/applications>,
@@ -283,6 +416,10 @@ to do the work.
 4. Run it:
 
    ```sh
+   # with the models in their own process (see One model, many bots)
+   SODACHAT_API_URL=http://127.0.0.1:8765 .venv/bin/python -m sodachat.discord_bot
+
+   # or on its own, models loaded here
    .venv/bin/python -m sodachat.discord_bot
    ```
 
@@ -292,26 +429,32 @@ every message it can read.
 **It runs the whole agent, not just chat.** A channel gets what the terminal
 gets: the [routing specialist](#a-routing-specialist-deciding-which-of-them-answers-you)
 picks which capability answers each message, and `/help`, `/play snake`,
-`/gen`, `/think`, `/route`, `/model`, `/persona` all work. Three things are specific to a
-chat room, and live in [rooms.py](sodachat/rooms.py):
+`/gen`, `/think`, `/route`, `/model`, `/persona` all work. Three things are
+specific to a chat room:
 
 * **Post an image and it gets looked at**; post a `.py`/`.js`/… and it gets
   read. This is the room equivalent of dropping a file into the terminal — the
-  attachment is downloaded to a scratch directory, the agent recognizes it as a
-  path, and the vision or code specialist takes it. Follow-ups work the same way
-  too (*"what was in that picture?"*). Files it can't use get a reason rather
-  than silence.
+  bot downloads the attachment, the models' side writes it into that channel's
+  own directory (the only place that channel can read from, see
+  [What a room is allowed to read](#what-a-room-is-allowed-to-read)), the agent
+  recognizes it as a path, and the vision or code specialist takes it. Follow-ups work the same way too (*"what was in that
+  picture?"*). Files it can't use get a reason rather than silence, and it asks
+  the models what they accept before spending the bandwidth
+  ([client.py](sodachat/client.py)).
 * **Each channel is its own conversation** — its own history, its own running
-  game, its own memory of the last image seen — while the models are loaded once
-  and shared. A second channel costs 0 MB, measured.
+  game, its own memory of the last image seen — keyed `discord:<channel id>`
+  ([rooms.py](sodachat/rooms.py)). A second channel costs 0 MB, measured, and a
+  second *bot* costs 51MB rather than a second copy of the models.
 * **Boards and code are fenced, long replies are split.** A 20×20 snake board or
   a `/help` table is column-aligned text that a proportional font destroys, so
   the block paragraphs (and only those) go in a code fence, and anything over
-  Discord's 2000-character limit is split without leaving a fence unclosed.
+  Discord's 2000-character limit is split without leaving a fence unclosed. That
+  is the transport's business, not the model's, so it happens here
+  ([transport.py](sodachat/transport.py)).
 
-Generation runs in a worker thread, one reply at a time, so the gateway
+Generation runs off the event loop, one reply at a time, so the gateway
 heartbeat and the typing indicator keep going while the model writes. Set
-`SODACHAT_AGENT=0` for the old plain-chat behaviour.
+`SODACHAT_AGENT=0` where the models load for the old plain-chat behaviour.
 
 ## Google Chat
 
@@ -341,14 +484,19 @@ and renders the JSON it returns.
    unauthenticated requests (fine for local testing only).
 
 Like the Discord bot, this runs the full agent: routing, `/commands`, games, and
-one agent per Chat space with the models shared between them. Two differences
-from Discord, both forced by the platform:
+one agent per Chat space — sharing the models with every other bot when
+`SODACHAT_API_URL` points at the [API server](#one-model-many-bots), and loading
+them here when it doesn't. Two differences from Discord, both forced by the
+platform:
 
 * **Attachments aren't read.** Google Chat sends a *reference* to an uploaded
   file, and fetching it needs the Chat API with service-account credentials —
   where Discord hands over a URL the bot can already use. So an upload arrives
   as an empty message with metadata, and the app says that rather than ignoring
-  it. `/see <path>` and `/code <path>` still work for files on the server.
+  it. `/see <path>` and `/code <path>` can't stand in for it either: a room only
+  reads files that were sent to it (see
+  [What a room is allowed to read](#what-a-room-is-allowed-to-read)), so this
+  frontend has no path to the vision and code specialists at all.
 * **One event, one reply**, so there is nowhere to put overflow: a reply past
   4096 characters is cut and marked, instead of split across messages.
 
@@ -1239,8 +1387,14 @@ sodachat/
   cli.py          # terminal chat UI (rich)
   export_onnx.py  # export the models to ONNX for the browser -> web/models/
   web.py          # static server for web/ (COOP/COEP, wasm MIME types)
-  rooms.py        # shared chat-room plumbing: one agent per room over one set of
-                  #   models, attachment staging, code fencing, message splitting
+  rooms.py        # the model side of a chat room: one agent per room over one set
+                  #   of checkpoints, attachment staging, per-room reset
+  api.py          # MASTER API SERVER: holds the models, serves every bot
+  client.py       # the other end — remote (HTTP) or in-process, same reply()
+  files.py        # which files the agent may open: per-room sandbox for bots,
+                  #   unrestricted only for the terminal the user owns
+  transport.py    # chat plumbing with no model imports: code fencing, message
+                  #   splitting, attachments, the env switches — what a bot needs
   discord_bot.py  # Discord chat frontend (discord.py), running the full agent
   google_chat.py  # Google Chat frontend (FastAPI webhook), running the full agent
   agent.py        # unified interface: chat (plain text) + /commands for games;

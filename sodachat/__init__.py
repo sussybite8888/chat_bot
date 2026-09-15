@@ -1,5 +1,6 @@
 """A small GPT trained from scratch: a chatbot (terminal, Discord, and Google
-Chat frontends sharing one engine) and a real-time game controller.
+Chat frontends sharing one engine — and, through api.py, one loaded copy of it)
+and a real-time game controller.
 
 MODEL MAP — every model, where its parts live, and its checkpoint
 ================================================================
@@ -46,8 +47,25 @@ The agent (agent.py) ties chat + games together and can run any of the single
 models via /model; which capability answers a plain-text message is decided by
 the routing specialist (route.py). Frontends: cli.py (plain terminal chat),
 agent.py's own terminal loop, and the chat rooms — discord_bot.py and
-google_chat.py, which run the full agent over the shared plumbing in rooms.py
-(one agent per room, one copy of the models).
+google_chat.py.
+
+SERVING — where the weights actually live
+=========================================
+
+    api.py        the master API server: loads the models once and answers
+                  {room, text, attachments} over HTTP. Run this, and every bot
+                  shares one copy of the checkpoints instead of loading its own
+    rooms.py      what the server holds: one SodaAgent per room (its own
+                  history, game, persona) over one set of loaded checkpoints
+    client.py     the bots' end of it — RemoteBackend (HTTP) or LocalBackend
+                  (models in this process, when SODACHAT_API_URL is unset);
+                  open_backend() picks, so a frontend has no branch for it
+    files.py      which files the agent may open, and where a room's uploads
+                  land: each room reads its own directory and nothing else —
+                  only the terminal agent, whose user owns the machine, is
+                  given the run of the filesystem
+    transport.py  the parts a bot needs with no model imports: code fencing,
+                  message splitting, attachments, the environment switches
 
 There is also a browser frontend, which runs the models *client-side* rather
 than calling into this package at all: export_onnx.py writes each model above
@@ -55,7 +73,18 @@ to ONNX, web.py serves the static page in web/, and web/js/ re-implements the
 tokenizer, sampling and reranking against onnxruntime-web (see the README).
 """
 
-from .engine import ChatEngine, Reply
-
 __version__ = "0.1.0"
 __all__ = ["ChatEngine", "Reply", "__version__"]
+
+
+def __getattr__(name: str):
+    """`from sodachat import ChatEngine` still works, but importing the package
+    no longer drags in PyTorch. That matters now that a bot can be a thin client
+    of the model server ([client.py](client.py)): `sodachat.client` and
+    `sodachat.transport` have no model dependency, and an eager import here
+    would have given them one anyway."""
+    if name in ("ChatEngine", "Reply"):
+        from . import engine
+
+        return getattr(engine, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

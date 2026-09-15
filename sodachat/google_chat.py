@@ -4,19 +4,22 @@ Google Chat delivers MESSAGE / ADDED_TO_SPACE events as JSON POSTs and renders
 whatever ``{"text": ...}`` we return. Point a Chat app (Google Cloud console ->
 Google Chat API -> Configuration) at this server's public HTTPS URL.
 
-Runs the full agent by default ([agent.py](agent.py)), so a space gets what the
-terminal does: the routing specialist picks which capability answers each
-message, and `/commands` work (`/play snake`, `/gen`, `/think`, `/route`,
-`/help`). Each space keeps its own agent — its own history, its own running
-game — while the models are loaded once and shared. `SODACHAT_AGENT=0` falls
-back to the plain chat engine.
+**The models live somewhere else.** Set `SODACHAT_API_URL` and this app is a
+thin client of the master API server ([api.py](api.py)) — one copy of the models
+shared with every other bot, and nothing heavier than httpx in this process.
+Without it the models load here, as they did before.
+
+Either way a space gets what the terminal does: the routing specialist picks
+which capability answers each message, and `/commands` work (`/play snake`,
+`/gen`, `/think`, `/route`, `/help`). Each space is its own conversation, keyed
+as `googlechat:<space>`.
 
 **Attachments are not read here.** Google Chat sends a reference, not the file,
 and fetching one needs the Chat API with service-account credentials — unlike
 Discord, where the attachment comes with a URL the bot can already use. So an
 uploaded image reaches this app as an empty message with metadata; the app says
 so rather than ignoring it. `/see <path>` still works for files on the machine
-running the server.
+running the *models*.
 
 Optionally set GOOGLE_CHAT_AUDIENCE to your Cloud project number to verify the
 bearer token Google attaches to each request (requires ``pip install
@@ -28,31 +31,19 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 
-from .engine import ChatEngine
-from .rooms import (
-    GOOGLE_CHAT_LIMIT,
-    Rooms,
-    agent_mode_enabled,
-    filtered_enabled,
-    format_reply,
-)
+from .client import Backend, BackendError, open_backend
+from .transport import GOOGLE_CHAT_LIMIT, format_reply, room_id
 
 log = logging.getLogger("sodachat.googlechat")
 
 _CHAT_ISSUER = "chat@system.gserviceaccount.com"
 
-engine: ChatEngine | None = None
-rooms: Rooms | None = None
-
-# Plain-chat mode only: recent lines per Chat space. In agent mode each space's
-# agent keeps its own history.
-_histories: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=8))
+backend: Backend | None = None
 
 _GREETING = (
     "hey! i'm a small chatbot trained from scratch — chat, games, and a handful "
@@ -68,23 +59,15 @@ _NO_ATTACHMENTS = (
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global engine, rooms
+    global backend
     load_dotenv()
-    filtered = filtered_enabled()
-    if agent_mode_enabled():
-        log.info("loading the agent (chat, games, and the specialists)...")
-        rooms = Rooms(filtered=filtered)
-        rooms.warm_up()
-        log.info("agent ready on %s", rooms.device)
-    else:
-        log.info("loading the chat model (SODACHAT_AGENT=0: plain chat)...")
-        engine = ChatEngine(filtered=filtered)
-        log.info("engine ready")
+    backend = await open_backend()
+    log.info("using %s", backend.describe())
     try:
         yield
     finally:
-        if rooms is not None:
-            rooms.stop()
+        await backend.close()
+        backend = None
 
 
 app = FastAPI(title="sodachat Google Chat app", lifespan=_lifespan)
@@ -116,8 +99,9 @@ def _verify_request(request: Request) -> None:
 
 @app.get("/healthz")
 async def healthz() -> dict:
-    return {"ok": True, "engine_ready": (rooms or engine) is not None,
-            "agent_mode": rooms is not None}
+    return {"ok": True, "engine_ready": backend is not None,
+            "agent_mode": bool(backend and backend.info.get("agent_mode")),
+            "models": backend.describe() if backend else None}
 
 
 @app.post("/")
@@ -136,17 +120,14 @@ async def on_event(request: Request) -> dict:
     text = message.get("argumentText") or message.get("text") or ""
     space = event.get("space", {}).get("name", "dm")
 
-    if rooms is None:  # plain chat
-        history = _histories[space]
-        reply = engine.reply(text, history=history)
-        history.extend([text, reply.text])
-        return {"text": reply.text}
-
     if not text.strip():
         attached = message.get("attachment") or message.get("attachments")
         return {"text": _NO_ATTACHMENTS} if attached else {}
     try:
-        reply = await rooms.reply(space, text)
+        reply = await backend.reply(room_id("googlechat", space), text)
+    except BackendError as e:
+        log.error("backend failed on space %s: %s", space, e)
+        return {"text": "something went wrong on my end, sorry."}
     except Exception:
         log.exception("failed to handle a message in space %s", space)
         return {"text": "something went wrong on my end, sorry."}
