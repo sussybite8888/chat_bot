@@ -19,7 +19,11 @@ import threading
 import time
 from pathlib import Path
 
-from .files import REFUSED, FileAccess
+from .actions import MAX_PER_TURN, TOOLS, Action, clean_arg
+from .actions import parse as parse_calls
+from .actions import pick_reaction
+from .files import (MAX_WORKSPACE_BYTES, MAX_WORKSPACE_FILES, REFUSED,
+                    FileAccess, FileRefused)
 from .game_train import game_model_path
 from .games import GAMES, GamePlayer, load_model
 
@@ -241,10 +245,94 @@ class SodaAgent:
         self.last_route: tuple[str, str, float] | None = None  # (message, route, conf)
         self.stats = {"replies": 0, "tokens": 0, "seconds": 0.0}
         self.last = {"tokens": 0, "ms": 0.0, "tok_s": 0.0, "hz": 0.0}
+        # What this turn wants *done* in the room it is speaking in — a
+        # reaction, a pin (actions.py). The agent only ever names these; the
+        # frontend that owns the transport collects them with `take_actions()`
+        # and performs the ones it can. Per-agent, i.e. per-room, and drained
+        # every turn: an act nobody came to collect is not saved for later.
+        self.pending: list[Action] = []
+        # Whether the *model* may reach for a tool on its own, as opposed to
+        # the user asking with `/react`. `/tools off` turns it off for one room
+        # without changing what any other room does.
+        self.tools = True
 
     # -------------------------------------------------------------- routing
 
     def handle(self, text: str) -> str:
+        """One turn: the words to say back.
+
+        Anything the turn wants *done* rather than said — a reaction, a pin —
+        is left in `self.pending` for the frontend to collect with
+        `take_actions()`. Splitting it that way is what lets the models sit in
+        an API server with no gateway connection of their own: the turn names
+        an act here, and the process holding the Discord socket performs it.
+        """
+        reply = self._answer(text)
+        return self._use_tools(text, reply)
+
+    def _use_tools(self, message: str, reply: str) -> str:
+        """The tool pass over a finished reply (see actions.py).
+
+        Two things can queue an act. The model can ask for one in the text it
+        generated (`[[react :kekw:]]`), including asking for a `/command` — it
+        has the same list the user does, so "play snake" is one thing the bot
+        can decide to do rather than only something it can be told to do. And
+        when it asked for nothing, `pick_reaction` gets a look at the message:
+        a trigger table standing in for a specialist nobody has trained yet,
+        which answers None for most messages on purpose.
+        """
+        if not self.tools:
+            # Off means "don't act", not "show your working": a call the model
+            # wrote still comes out of the text, it just doesn't happen.
+            return parse_calls(reply, extra=_COMMANDS.keys())[0]
+        reply, calls = parse_calls(reply, extra=_COMMANDS.keys())
+        for call in calls:
+            if call.name in TOOLS:
+                self._queue(call)
+                continue
+            # A /command the model called itself. What comes back is text, so
+            # it joins the reply — and calls *inside* that text are stripped
+            # rather than run, so one turn can't drive the bot in a loop.
+            out, _ = parse_calls(_COMMANDS[call.name](self, call.arg))
+            reply = f"{reply}\n{out}".strip() if reply.strip() else out
+        if self.pending:
+            return reply
+        route = (self.last_route[1] if self.last_route is not None
+                 and self.last_route[0] == message else None)
+        if (emoji := pick_reaction(message, route, self.persona.name)) is not None:
+            self._queue(Action("react", emoji))
+        return reply
+
+    def watch(self, text: str) -> tuple[Action, ...]:
+        """What to do about a message nobody addressed to the bot.
+
+        A channel is mostly people talking to each other, and a bot that only
+        ever reacts to things said *at* it is a bot standing in the corner. So
+        the frontend passes those messages through here too — but this path
+        generates nothing, reads no history and writes none: it is
+        `pick_reaction` and a persona, costing one pass over a trigger table.
+        That is the whole reason it can be run over every message in a channel
+        without the models noticing.
+        """
+        if not self.tools:
+            return ()
+        emoji = pick_reaction(text, None, self.persona.name)
+        return (Action("react", emoji),) if emoji is not None else ()
+
+    def _queue(self, action: Action) -> None:
+        """Ask for one act, at most `MAX_PER_TURN` per turn and never the same
+        one twice — Discord answers a repeated reaction with a 400, and a model
+        that has got stuck should not be able to paper a message in emoji."""
+        if action not in self.pending and len(self.pending) < MAX_PER_TURN:
+            self.pending.append(action)
+
+    def take_actions(self) -> tuple[Action, ...]:
+        """The acts this turn asked for, cleared as they are handed over. A
+        frontend that never calls this simply performs none of them."""
+        out, self.pending = tuple(self.pending), []
+        return out
+
+    def _answer(self, text: str) -> str:
         s = text.strip()
         if s.startswith("/"):
             name, _, arg = s[1:].partition(" ")
@@ -1171,8 +1259,131 @@ class SodaAgent:
         lines.append("switch with: /model expert | specialist | unified | instruct")
         return "\n".join(lines)
 
+    def _request(self, name: str, arg: str) -> str:
+        """Queue one room act, as `/react 🔥` asks for — the deterministic half
+        of tool use, and the half that keeps working with `/tools off`.
+
+        The answer says what was asked for rather than what happened: the act
+        is performed by the frontend after this reply is posted, and whether it
+        was allowed (`DISCORD_ALLOWED_ACTIONS`) or permitted (the bot's role in
+        that server) is not knowable from in here."""
+        tool = TOOLS[name]
+        if (value := clean_arg(tool, arg)) is None:
+            if tool.takes == "emoji" and arg:
+                return f"{arg!r} isn't an emoji I can react with."
+            hint = " — 🔥, or :kekw: for a server one" if tool.takes == "emoji" else ""
+            return f"Usage: /{name} <{tool.takes}>{hint}"
+        arg = value
+        self._queue(Action(name, arg))
+        return f"ok — {tool.doc}{f': {arg}' if arg else ''}."
+
+    # ------------------------------------------------------------- files
+
+    def _cmd_files(self, arg: str) -> str:
+        """What I'm keeping: `/files`.
+
+        The sandbox as the agent sees it — relative names and sizes, never the
+        host path it happens to live at, which is the server's business and not
+        the room's."""
+        if not self.files.writes:
+            return "I've nowhere to keep files in this conversation."
+        entries = self.files.listing()
+        if not entries:
+            return ("my folder is empty. /write <name> <text> starts it off, "
+                    "and I can read it back with /read <name>.")
+        width = min(max(len(name) for name, _ in entries), 40)
+        lines = [f"  {name:<{width}}  {size:>8,} B" for name, size in entries]
+        files, total = self.files.usage()
+        return ("what I'm keeping:\n" + "\n".join(lines) +
+                f"\n{files}/{MAX_WORKSPACE_FILES} files, {total / 1024:,.1f} KB "
+                f"of {MAX_WORKSPACE_BYTES // 1024 // 1024} MB")
+
+    def _cmd_read(self, arg: str) -> str:
+        """Print a file back: `/read notes.txt`."""
+        if not arg.strip():
+            return "Usage: /read <file> — /files lists what I have."
+        try:
+            path, text, cut = self.files.read_text(arg)
+        except FileRefused as e:
+            return str(e)
+        if not text.strip():
+            return f"{path.name} is empty."
+        return f"{path.name}:\n{text}" + ("\n(...cut off there)" if cut else "")
+
+    def _keep(self, arg: str, append: bool) -> str:
+        """`/write` and `/append`, which differ by one flag. The filename is the
+        first word and everything after it is the contents, newlines included —
+        so a multi-line message writes a multi-line file."""
+        verb = "append" if append else "write"
+        parts = arg.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1]:
+            return f"Usage: /{verb} <file> <text>"
+        try:
+            path = self.files.write_text(parts[0], parts[1], append=append)
+        except FileRefused as e:
+            return str(e)
+        size = path.stat().st_size
+        return (f"{'added to' if append else 'wrote'} {path.name} "
+                f"({size:,} B). /read {path.name} to see it.")
+
+    def _cmd_write(self, arg: str) -> str:
+        """Keep a file: `/write notes.txt what darren likes about snake`."""
+        return self._keep(arg, append=False)
+
+    def _cmd_append(self, arg: str) -> str:
+        """Add to one: `/append notes.txt ...`."""
+        return self._keep(arg, append=True)
+
+    def _cmd_rm(self, arg: str) -> str:
+        """Throw one away: `/rm notes.txt`."""
+        if not arg.strip():
+            return "Usage: /rm <file>"
+        try:
+            path = self.files.remove(arg)
+        except FileRefused as e:
+            return str(e)
+        return f"deleted {path.name}."
+
+    def _cmd_tools(self, arg: str) -> str:
+        """Show the tools, or let the model stop reaching for them: `/tools off`.
+
+        Off is per-room and covers only what the *model* starts. `/react` and
+        the rest still work, because those are the user asking."""
+        from .actions import describe
+
+        want = arg.strip().lower()
+        if want in {"off", "0", "no", "stop"}:
+            self.tools = False
+            self.pending.clear()
+            return ("tool use off — I'll react and pin only when you ask me to "
+                    "(/react, /pin, ...). /tools on to give it back.")
+        if want in {"on", "1", "yes"}:
+            self.tools = True
+            return "tool use on — I'll react when something lands."
+        state = "on" if self.tools else "off (/tools on)"
+        lines = [describe(), f"reaching for them on my own: {state}"]
+        if self.files.writes:
+            files, total = self.files.usage()
+            lines.append(f"and a folder of my own: {files} file"
+                         f"{'' if files == 1 else 's'}, {total / 1024:,.1f} KB "
+                         f"(/files, /read, /write, /append, /rm)")
+        return "\n".join(lines)
+
     def _cmd_help(self, arg: str) -> str:
         return "commands:\n" + "\n".join(f"  {c:16} {d}" for c, d in _HELP)
+
+
+def _room_command(name: str):
+    """`/react`, `/pin`, ... — one handler per room act, built from the tool
+    table so the two lists can't drift apart (actions.py owns the vocabulary;
+    this just exposes it as commands)."""
+
+    def run(self: SodaAgent, arg: str) -> str:
+        return self._request(name, arg)
+
+    run.__name__ = f"_cmd_{name}"
+    run.__doc__ = f"{TOOLS[name].doc.capitalize()}."
+    return run
 
 
 # name -> handler. The dispatch is a table, not a branch chain.
@@ -1207,7 +1418,19 @@ _COMMANDS = {
     "personality": SodaAgent._cmd_persona,
     "vibe": SodaAgent._cmd_persona,
     "stats": SodaAgent._cmd_stats,
+    "files": SodaAgent._cmd_files,
+    "ls": SodaAgent._cmd_files,
+    "dir": SodaAgent._cmd_files,
+    "read": SodaAgent._cmd_read,
+    "cat": SodaAgent._cmd_read,
+    "write": SodaAgent._cmd_write,
+    "save": SodaAgent._cmd_write,
+    "append": SodaAgent._cmd_append,
+    "rm": SodaAgent._cmd_rm,
+    "tools": SodaAgent._cmd_tools,
     "help": SodaAgent._cmd_help,
+    # The room acts, straight off the tool table (actions.py).
+    **{name: _room_command(name) for name in TOOLS},
 }
 
 # For /help. /watch and /exit are handled by the terminal loop, not the agent.
@@ -1234,6 +1457,22 @@ _HELP = [
     ("/length", "how long replies may run: short | medium | long"),
     ("/persona [name]", "how the bot sounds: cheerful | deadpan | ... (no name lists)"),
     ("/stats", "generation speed: tok/s, ms/reply, frequency"),
+    ("/react <emoji>", "react to the message you just sent (🔥, or :kekw: for a"
+     " server emoji); /unreact takes it back off"),
+    ("/say <text>", "post that in the channel; /delete takes back the last"
+     " thing I said; /dm <text> sends it privately instead"),
+    ("/pin", "pin that message — /unpin undoes it; /thread <name> splits it off"),
+    ("/rename <name>", "rename whoever I'm answering — @mention someone in the"
+     " command to pick a different person; /nick <name> renames me instead;"
+     " /role and /unrole hand out roles the same way"),
+    ("/topic <text>", "set the channel topic; /slowmode <seconds> its slowmode;"
+     " /status <text> what I'm shown as playing"),
+    ("/files", "what I'm keeping in my own folder (/ls); /read <file> prints"
+     " one back"),
+    ("/write <file> <text>", "keep a file — /append <file> <text> adds to it,"
+     " /rm <file> throws it away"),
+    ("/tools", "what I can do in a room besides talk, and whether I may reach"
+     " for it myself (/tools off stops me)"),
     ("/help", "this list"),
     ("/exit", "leave"),
 ]
@@ -1279,11 +1518,15 @@ def main() -> None:
     from rich.console import Console
     from rich.markup import escape
 
+    from .files import DEFAULT_WORKSPACE
+
     console = Console()
     # The terminal's user owns this machine, so /see and /code work on any file
     # they could have opened themselves. Every other frontend is remote input
-    # and gets a sandbox instead (rooms.py).
-    agent = SodaAgent(files=FileAccess.anywhere())
+    # and gets a sandbox instead (rooms.py). Writing is narrower than reading
+    # even here: `workspace/` in the repo and nowhere else, because /write can
+    # now be something the model reached for rather than something you typed.
+    agent = SodaAgent(files=FileAccess.anywhere(workspace=DEFAULT_WORKSPACE))
     console.print("[bold cyan]sodachat agent[/] — just type to chat. "
                   "Commands start with '/'; type [bold]/help[/].")
     while True:
@@ -1311,6 +1554,13 @@ def main() -> None:
         out = agent.handle(text)
         dt = time.perf_counter() - t0
         console.print(f"[bold magenta]bot ›[/] {escape(out)}")
+        # A terminal has nothing to react to, so an act is reported instead of
+        # performed — which also makes this the place to watch what the bot
+        # would be doing in a channel.
+        if acts := agent.take_actions():
+            done = " ".join(escape(a.render()) for a in acts)
+            console.print(f"[dim]  {done} — a chat room would do that; "
+                          f"a terminal can't[/]")
         cg = agent.continuous
         if cg is not None and agent.continuous is cg:  # one-line pulse of the game
             console.print(f"[dim]  {cg.game_cls.NAME}: {cg.hud()}[/]")

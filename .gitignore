@@ -9,3 +9,4 @@ web/vendor/
 node_modules/
 dist/
 data/
+workspace/

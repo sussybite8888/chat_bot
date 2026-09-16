@@ -2,7 +2,10 @@
 
 A frontend wants one thing — "here's a message and maybe some files, give me a
 reply" — and shouldn't care whether the model is in this process or behind an
-HTTP call. That's `Backend`, with two implementations:
+HTTP call. That's `Backend`, with two implementations. A reply is a `Reply`
+([actions.py](actions.py)): the words to post, and any acts the turn wants
+taken in the room — a reaction, a pin — which the *frontend* performs, because
+it is the end of this that holds a connection to the chat service.
 
 * `RemoteBackend` — the master API server ([api.py](api.py)). One copy of the
   models for every bot pointed at it, and this process never imports torch.
@@ -28,6 +31,7 @@ from typing import Protocol, Sequence
 
 import httpx
 
+from .actions import Action, Reply
 from .transport import (
     MAX_ATTACHMENT_BYTES,
     Attachment,
@@ -56,7 +60,8 @@ class Backend(Protocol):
 
     async def start(self) -> None: ...
     async def reply(self, room: str, text: str,
-                    attachments: Sequence[Attachment] = ()) -> str: ...
+                    attachments: Sequence[Attachment] = ()) -> Reply: ...
+    async def watch(self, room: str, text: str) -> tuple[Action, ...]: ...
     async def reset(self, room: str) -> None: ...
     async def close(self) -> None: ...
     def accepts(self, filename: str) -> bool: ...
@@ -94,6 +99,9 @@ class RemoteBackend(_Common):
         self._http = httpx.AsyncClient(base_url=self.url, headers=headers,
                                        timeout=timeout)
         self.info = {}
+        # Cleared for good the first time the server 404s /v1/watch, so an
+        # older server costs one wasted request rather than one per message.
+        self._watchable = True
 
     async def start(self) -> None:
         """Fetch what the server is, which doubles as the connection check: a
@@ -124,7 +132,7 @@ class RemoteBackend(_Common):
                                f"that isn't JSON") from None
 
     async def reply(self, room: str, text: str,
-                    attachments: Sequence[Attachment] = ()) -> str:
+                    attachments: Sequence[Attachment] = ()) -> Reply:
         payload = {
             "room": room,
             "text": text,
@@ -143,9 +151,40 @@ class RemoteBackend(_Common):
         except httpx.HTTPError as e:
             raise BackendError(f"the model server is unreachable ({e})") from None
         try:
-            return response.json()["text"]
-        except (ValueError, KeyError):
+            body = response.json()
+            # `actions` is optional on the wire: an older server doesn't send
+            # the field, and a reply with no acts in it is the common case.
+            return Reply(body["text"], tuple(
+                Action(a["name"], a.get("arg", "")) for a in body.get("actions", [])))
+        except (ValueError, KeyError, TypeError):
             raise BackendError("the model server sent a reply I can't read") from None
+
+    async def watch(self, room: str, text: str) -> tuple[Action, ...]:
+        """What to do about a message that wasn't addressed to the bot.
+
+        Asked about every message a channel bot can see, so unlike `reply` a
+        failure here is worth nothing more than a shrug: the answer is usually
+        "nothing" anyway, and a bot that stopped talking because it couldn't
+        decide whether to react would be a poor trade. A server too old to
+        know the route is asked exactly once.
+        """
+        if not self._watchable:
+            return ()
+        try:
+            response = await self._http.post("/v1/watch",
+                                             json={"room": room, "text": text})
+            if response.status_code == 404:
+                self._watchable = False
+                log.info("%s has no /v1/watch — it predates unprompted "
+                         "reactions; not asking again", self.url)
+                return ()
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            log.debug("could not ask %s about %s", self.url, room)
+            return ()
+        return tuple(Action(a["name"], a.get("arg", ""))
+                     for a in body.get("actions", []) if "name" in a)
 
     async def reset(self, room: str) -> None:
         try:
@@ -184,12 +223,17 @@ class LocalBackend(_Common):
         self.info = self._rooms.info()
 
     async def reply(self, room: str, text: str,
-                    attachments: Sequence[Attachment] = ()) -> str:
+                    attachments: Sequence[Attachment] = ()) -> Reply:
         try:
             return await self._rooms.reply(room, text, attachments)
         except Exception as e:
             log.exception("failed to answer in room %s", room)
             raise BackendError(str(e)) from None
+
+    async def watch(self, room: str, text: str) -> tuple[Action, ...]:
+        # No thread and no lock: this is a pass over a trigger table, not a
+        # generation (rooms.Rooms.watch).
+        return self._rooms.watch(room, text)
 
     async def reset(self, room: str) -> None:
         self._rooms.reset(room)
@@ -258,7 +302,13 @@ def main(argv: list[str] | None = None) -> None:
             if a.reset:
                 await backend.reset(a.room)
             attachments = [Attachment(f.name, f.read_bytes()) for f in a.file]
-            print(await backend.reply(a.room, " ".join(a.text), attachments))
+            answer = await backend.reply(a.room, " ".join(a.text), attachments)
+            print(answer.text)
+            # There is no room here to react in, so the acts are reported
+            # rather than performed — which is also how you check what the
+            # model would have done in a channel.
+            for action in answer.actions:
+                print(f"  (would {action.render()})")
         finally:
             await backend.close()
 

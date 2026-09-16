@@ -311,8 +311,13 @@ def render_lines(group: list[dict], speakers: str) -> tuple[list[str], int]:
 
 def cmd_render(args) -> None:
     source = Path(args.jsonl)
+    # split("\n"), not splitlines(): `export` writes with ensure_ascii=False, so
+    # a message carrying U+0085/U+2028/U+2029 keeps it verbatim -- json.dumps
+    # leaves those unescaped, but splitlines() treats them as line breaks and
+    # tears one record in half. Real newlines in content are escaped, so "\n"
+    # is the only separator the writer ever emits.
     messages = [json.loads(line) for line in
-                source.read_text(encoding="utf-8").splitlines() if line.strip()]
+                source.read_text(encoding="utf-8").split("\n") if line.strip()]
 
     # Resolved against every message, including the ones about to be dropped,
     # so a reply can be told from what it was replying to.

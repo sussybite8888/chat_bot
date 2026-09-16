@@ -124,7 +124,9 @@ async def on_event(request: Request) -> dict:
         attached = message.get("attachment") or message.get("attachments")
         return {"text": _NO_ATTACHMENTS} if attached else {}
     try:
-        reply = await backend.reply(room_id("googlechat", space), text)
+        # Google Chat has no reaction API for an app to call, so a turn's acts
+        # (actions.py) are dropped here — the words are the whole reply.
+        reply = (await backend.reply(room_id("googlechat", space), text)).text
     except BackendError as e:
         log.error("backend failed on space %s: %s", space, e)
         return {"text": "something went wrong on my end, sorry."}

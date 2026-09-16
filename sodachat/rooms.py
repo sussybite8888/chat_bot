@@ -2,8 +2,8 @@
 the checkpoints for the whole process.
 
 This is what the master API server ([api.py](api.py)) runs. A room bot is the
-terminal agent ([agent.py](agent.py)) with four differences, and this module is
-those four differences so no frontend grows its own version:
+terminal agent ([agent.py](agent.py)) with six differences, and this module is
+those six differences so no frontend grows its own version:
 
   * **Many conversations at once.** Each room gets its own `SodaAgent` — its own
     history, its own running game, its own memory of the last image seen — while
@@ -15,10 +15,21 @@ those four differences so no frontend grows its own version:
     dropped file looks like in a terminal. `Rooms.reply` writes the attachments a
     room sent into a scratch directory and rewrites the message to name them, so
     `/see`-style handling works with no change to the agent — and so a bot on
-    another machine can hand over a file it downloaded.
+    another machine can hand over a file it downloaded. That directory is also
+    the room's *notepad*: what the agent writes there itself (`/write`) outlives
+    the turn and is thrown away with the room.
   * **The transport renders Markdown and caps message length.** Handled by the
     frontend now, with the formatting in [transport.py](transport.py), because
     the cap belongs to the transport and not to the model.
+  * **A turn can ask for more than words.** The agent names the acts it wants
+    taken in the room it is speaking in — a reaction, a pin ([actions.py](
+    actions.py)) — and `reply` returns them alongside the text. Nothing here
+    performs one: this process has no gateway connection, and the frontend that
+    does is the only thing that can.
+  * **It can watch as well as answer.** `watch` is the other half of a chat
+    room: what to do about a message nobody addressed to the bot. It generates
+    nothing and keeps nothing, so a frontend can run a whole channel through
+    it.
   * **The event loop must not block.** Generation takes seconds; `Rooms.reply`
     runs it in a worker thread, one at a time, so an HTTP server (or a gateway
     heartbeat, when the models are in-process) keeps flowing while a reply is
@@ -36,8 +47,9 @@ import os
 from collections import deque
 from typing import Sequence
 
+from .actions import Action, Reply, pick_reaction
 from .agent import SodaAgent
-from .files import FileAccess, FileStore, with_paths
+from .files import MAX_WORKSPACE_BYTES, FileAccess, FileStore, with_paths
 from .transport import (
     DISCORD_LIMIT,
     GOOGLE_CHAT_LIMIT,
@@ -55,9 +67,11 @@ __all__ = [
     "DISCORD_LIMIT",
     "GOOGLE_CHAT_LIMIT",
     "MAX_ATTACHMENT_BYTES",
+    "Action",
     "Attachment",
     "FileAccess",
     "FileStore",
+    "Reply",
     "Rooms",
     "agent_mode_enabled",
     "fence_blocks",
@@ -148,8 +162,10 @@ class Rooms:
             "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
             # Not the path — that is the server's business, and a client has no
             # use for it. Only that rooms are confined, which is a promise the
-            # other end can check.
-            "file_access": "per-room sandbox",
+            # other end can check, and that a room can keep files there
+            # (files.py), which is a thing a frontend may want to mention.
+            "file_access": "per-room sandbox (read and write)",
+            "workspace_bytes": MAX_WORKSPACE_BYTES,
         }
 
     # -------------------------------------------------------------- replies
@@ -164,8 +180,9 @@ class Rooms:
         self.reset("__warmup__")  # including the directory it was given
 
     async def reply(self, room: str, text: str,
-                    attachments: Sequence[Attachment] = ()) -> str:
-        """One reply, generated off the event loop and one at a time.
+                    attachments: Sequence[Attachment] = ()) -> Reply:
+        """One reply — what to say, and what to do — generated off the event
+        loop and one at a time.
 
         `attachments` are staged inside the room's own directory and named in
         the message before it reaches the agent, then deleted — the agent keeps
@@ -176,14 +193,39 @@ class Rooms:
                 return await asyncio.to_thread(self._reply, room,
                                                with_paths(text, paths))
 
-    def _reply(self, room: str, text: str) -> str:
+    def _reply(self, room: str, text: str) -> Reply:
         """The blocking half of `reply`, run in a worker thread."""
         if self.agent_mode:
-            return self.agent(room).handle(text)
+            agent = self.agent(room)
+            # Drained in the same breath as the text is taken: the acts belong
+            # to this turn, and a frontend that fails to post the reply should
+            # not find them waiting on the next one.
+            return Reply(agent.handle(text), agent.take_actions())
         history = self._histories.setdefault(room, deque(maxlen=_PLAIN_HISTORY))
         reply = self.engine().reply(text, history=history)
         history.extend([text, reply.text])
-        return reply.text
+        # Plain chat is the engine and nothing else — no agent, so no tools.
+        return Reply(reply.text)
+
+    def watch(self, room: str, text: str) -> tuple[Action, ...]:
+        """What to do about a message that wasn't addressed to the bot.
+
+        The cheap path on purpose: no generation, no history, no lock, no
+        thread — a frontend can run every message in a channel through here
+        and the models never know. An existing room answers with its own
+        persona and its own `/tools off`; a room nobody has talked in yet is
+        answered from the process default rather than conjured into existence,
+        because an agent means a history and a directory on disk and watching
+        a channel should cost neither.
+        """
+        if not self.agent_mode:
+            return ()
+        if (agent := self._agents.get(room)) is not None:
+            return agent.watch(text)
+        from .persona import resolve_persona
+
+        emoji = pick_reaction(text, None, resolve_persona().name)
+        return (Action("react", emoji),) if emoji is not None else ()
 
     def stop(self) -> None:
         """Stop anything still running in the background (a room that left a

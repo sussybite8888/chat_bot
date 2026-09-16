@@ -17,7 +17,7 @@ Two model backends:
 
 | Backend | What it is | Notes |
 |---|---|---|
-| `mini` (default) | A ~14M-param GPT (RoPE / RMSNorm / QK-norm / squared-ReLU FFN / logit softcap) with an 8k BPE subword vocabulary, both trained **from scratch** on [SODA](https://huggingface.co/datasets/allenai/soda) (~1.2M narrative-grounded dialogues, ~210M tokens), for ~4 epochs under [Muon](https://kellerjordan.github.io/posts/muon/) + a warmup-stable-decay schedule | Wants a GPU: ~24h. No pretrained weights anywhere. |
+| `mini` (default) | A ~14M-param GPT (RoPE / RMSNorm / QK-norm / squared-ReLU FFN / logit softcap) with an 8k BPE subword vocabulary, both trained **from scratch** on [SODA](https://huggingface.co/datasets/allenai/soda) (~1.2M narrative-grounded dialogues, ~210M tokens) blended with [Pre-1929 Books](https://huggingface.co/datasets/common-pile/pre_1929_books_filtered) prose and your own `data/`, under [Muon](https://kellerjordan.github.io/posts/muon/) + a warmup-stable-decay schedule | Wants a GPU: ~24h. No pretrained weights anywhere. |
 | `gpt2` | GPT-2 (124M) fine-tuned on dialogue data | Opt-in: never started automatically |
 
 Select with `--backend` (CLI) or `SODACHAT_BACKEND` (Discord / Google Chat).
@@ -118,9 +118,9 @@ python3 -m venv .venv
 cp .env.example .env   # then fill in tokens as needed
 ```
 
-Datasets download automatically on first use: SODA and DailyDialog from the
-Hugging Face hub, NPS Chat via NLTK (`pip install nltk`, only needed for
-`--dataset nps`).
+Datasets download automatically on first use: SODA, DailyDialog and Pre-1929
+Books from the Hugging Face hub, NPS Chat via NLTK (`pip install nltk`, only
+needed for `--dataset nps`).
 
 ## Training
 
@@ -130,14 +130,46 @@ Hugging Face hub, NPS Chat via NLTK (`pip install nltk`, only needed for
 .venv/bin/python -m sodachat.finetune                 # GPT-2 (needs >=16GB / GPU)
 ```
 
-The dataset is tokenized once into a flat `uint16` file under `models/`
-(`soda-train.bin`, ~420MB) and memory-mapped during training, so RAM use stays
-flat regardless of corpus size. That step takes ~7 min and is cached.
-Checkpoints (`models/minigpt-soda.pt`) keep the best validation loss, with the
-BPE vocabulary stored inside.
+Each corpus is tokenized once into a flat `uint16` file under `models/`
+(`soda+books+local-dialog-train.bin`, ~420MB, and one file per stream beside it)
+and memory-mapped during training, so RAM use stays flat regardless of corpus
+size. That step takes ~15 min and is cached. Checkpoints
+(`models/minigpt-soda.pt`) keep the best validation loss, with the BPE
+vocabulary stored inside.
 
 Flags: `--dataset soda|dailydialog|nps`, `--steps`, `--batch-size`, `--lr`,
-`--device`, `--out`, `--seed`, `--data-dir`, `--no-local-data`.
+`--device`, `--out`, `--seed`, `--data-dir`, `--no-local-data`,
+`--books-tokens`, `--local-end-weight`, `--local-start-weight`,
+`--local-ramp-frac`.
+
+### Books: the English the dialogue corpora assume
+
+A chat corpus teaches turn-taking, not English. SODA's turns are short, modern
+and machine-written, and a model fed nothing else is fluent in chat and thin
+everywhere else — which at 77M parameters mostly shows up as a small vocabulary
+and collapsing syntax on anything longer than a sentence.
+
+So the run also trains on [Pre-1929
+Books](https://huggingface.co/datasets/common-pile/pre_1929_books_filtered)
+(Common Pile v0.1): ~130k US books published before 1929, in the public domain
+since 2024, OCR'd by the Internet Archive for HathiTrust. Long-form edited prose,
+and permissively licensed — the same bar the rest of the corpora clear.
+
+It is 26 gzipped shards, ~19.5GB, so a run takes a slice off the front rather
+than the lot: `--books-tokens` (default 150M, `0` disables) is a budget, and the
+shards stream straight off the wire — decompressed line by line, nothing but the
+tokens written to disk. The last shard is held out, so validation prose is books
+the run never saw.
+
+The text is OCR of printed pages, which needs undoing before it is English:
+lines are hard-wrapped at the column width (feed that in raw and the model
+learns to break a line every seventy characters), words are split across line
+ends with hyphens, and every book carries title pages, running heads, page
+numbers and an index. `data.clean_book_text` rejoins the paragraphs and
+`_is_prose` drops the furniture — a paragraph of fewer than three words, under
+80% letters, or without a single lowercase character is page furniture, not
+prose. What survives is cut into ~4000-character passages on paragraph
+boundaries, each an untagged document like your own files.
 
 ### Your own training data (`data/`)
 
@@ -159,12 +191,33 @@ data/
 .venv/bin/python -m sodachat.codegen train      # source files mixed into CodeSearchNet
 ```
 
-Text files become untagged documents in the same token stream as the dialogues,
-each terminated by `<|endofdialog|>` so the document-boundary attention mask
-(below) keeps one file from bleeding into the next; ~8% are held out for
-validation. The tokenized cache is fingerprinted against the folder, so editing
-a file re-tokenizes on the next run rather than silently training on the old
-copy. Source files go in under the same language headers (`# python`,
+Text files become untagged documents, each terminated by `<|endofdialog|>` so
+the document-boundary attention mask (below) keeps one file from bleeding into
+the next; ~8% are held out for validation. The tokenized cache is fingerprinted
+against the folder, so editing a file re-tokenizes on the next run rather than
+silently training on the old copy.
+
+**Your data gets the end of the run.** Dialogues, books and `data/` are
+tokenized to separate files and each batch is drawn from all three, which means
+the blend is a dial rather than a consequence of how many bytes each one has.
+`data/` is the corpus the model is ultimately for and also the smallest by
+orders of magnitude, so it is scheduled: it keeps its natural token share for
+the bulk of training and then ramps to `--local-end-weight` (default 5% of each
+batch) over the final `--local-ramp-frac` (default 0.2) of the run — the same
+stretch the WSD schedule spends decaying the learning rate. That is the cheapest
+voice a small corpus can buy. The weights barely move once the rate has decayed,
+so what arrives during the decay is what the finished model sounds like, while
+the big corpora stay in the mixture throughout and the ending is a shift in
+emphasis rather than a fine-tune that forgets.
+
+The trade is repetition: a few hundred KB of your own writing, at 5% of a batch
+for 32k steps, is thousands of passes over the same files, and a model will
+memorize what it sees that often. The startup log prints exactly how many passes
+your `data/` works out to and warns past 100, so tune `--local-end-weight` to it
+rather than the other way round. Validation is deliberately *not* measured at
+the training blend — it stays at the natural one all run, so "best val loss so
+far" compares like with like, and the per-stream losses are logged next to it
+(`val 2.417 (dialog 2.31 books 3.02 local 2.88)`). Source files go in under the same language headers (`# python`,
 `// javascript`) and the same machine-generated-code filter as the rest of the
 codegen corpus; an extension outside the list above is skipped rather than fed
 in untagged. Details and the full skip list: [data/README.md](data/README.md).
@@ -323,7 +376,8 @@ of the checkpoints — behind five endpoints:
 |---|---|
 | `GET /healthz` | whether the models are loaded (unauthenticated, for probes) |
 | `GET /v1/info` | device, mode, and which attachments it will accept |
-| `POST /v1/reply` | `{room, text, attachments?, reset?}` → `{text, seconds}` |
+| `POST /v1/reply` | `{room, text, attachments?, reset?}` → `{text, seconds, actions}` |
+| `POST /v1/watch` | `{room, text}` → `{actions}` for a message the bot wasn't sent — a reaction, usually nothing. Runs no model |
 | `GET /v1/rooms` | the live conversations |
 | `POST /v1/rooms/reset` | forget one room (or all of them) |
 
@@ -341,7 +395,7 @@ Generation stays serialized on `Rooms`' lock — one model, one decode at a time
 so concurrent requests queue rather than contend. Four at once on CPU came back
 in 3.7/7.8/11.9/16.3s, which is four ~4s replies in a row and no failures.
 
-### What a room is allowed to read
+### What a room is allowed to read — and write
 
 The agent reads files: `/see photo.png` classifies an image, `/code app.py` names
 a language, and a path sitting in a message is picked up and handled by what it
@@ -354,18 +408,33 @@ message any bot could otherwise walk the host filesystem — `/code /etc/passwd`
 hands over what it found. So file access is a policy the frontend picks
 ([files.py](sodachat/files.py)), not something the agent decides:
 
-| | |
-|---|---|
-| `FileAccess.nothing()` | no file is readable — **the default**, so a frontend that forgets to think about this is closed rather than open |
-| `FileAccess.rooted(dir)` | only what's under `dir`, symlinks resolved |
-| `FileAccess.anywhere()` | no restriction; passed explicitly by the terminal agent, and by nothing else |
+| | reads | writes |
+|---|---|---|
+| `FileAccess.nothing()` | nothing — **the default**, so a frontend that forgets to think about this is closed rather than open | nothing |
+| `FileAccess.rooted(dir)` | only what's under `dir`, symlinks resolved | the same directory |
+| `FileAccess.anywhere()` | anything the process can; passed explicitly by the terminal agent, and by nothing else | **only its workspace** |
 
-Each room gets a directory of its own and its agent is rooted there. The only
-thing ever written into it is the attachments of the message being answered, and
-they are deleted when the turn ends — so a room can read the files it just sent
-and nothing else: not another room's files, not the server's, not yours.
-`/v1/info` reports `"file_access": "per-room sandbox"`, so the other end can
-check the promise.
+Each room gets a directory of its own and its agent is rooted there, and that
+directory is also where it may **write**: `/write notes.txt ...`, `/append`,
+`/read`, `/rm`, `/files` — which the model can reach for itself, so "remember
+that" can become a file rather than a promise. The attachments of the message
+being answered are staged there and deleted when the turn ends; what the agent
+writes itself stays until the room is reset. So a room can read what it sent
+and what it has written down, and nothing else: not another room's files, not
+the server's, not yours. `/v1/info` reports `"file_access": "per-room sandbox
+(read and write)"`, so the other end can check the promise.
+
+**Reading and writing are separate policies, and writing is always the narrower
+one.** A terminal's user owns the machine, so `/code ~/notes.md` there is no
+more access than `cat` — but the model can now *start* an operation rather than
+only answer one, and a sampled `[[rm ~/.ssh/id_rsa]]` is nobody's idea of a
+feature. So even the terminal agent writes in one place and one place only:
+`workspace/` in the repo, created on first use, where you can go and look at
+what it kept.
+
+The workspace is quota'd — 256 KB a file, 4 MB and 64 files a room — because a
+model that gets stuck in a loop writing files is a thing that happens, and a
+full disk on the box holding the models takes every room down with it.
 
 Everything a prober would try is refused, and refused the same way — an answer
 that said "no such file" for one path and "not allowed" for another would be an
@@ -378,6 +447,14 @@ oracle for what exists on the host:
 /code sodachat/api.py             → (the same)
 /see /dev/zero                    → (the same)
 /code mine.py     (just uploaded) → That's python — I'm 99% sure.
+
+/write ../../../tmp/pwned x       → I can only write inside my own folder.
+/write /etc/passwd x              → (the same)
+/write ~/x                        → I can't write to a home directory.
+/write link.txt x   (a symlink planted in the sandbox, pointing out)
+                                  → I can only write inside my own folder.
+/rm somedir                       → only files, never a directory tree
+/write notes.txt hello            → wrote notes.txt (5 B).
 ```
 
 Checked at the policy level too: another room's directory, `..` in every
@@ -393,6 +470,8 @@ Talk to it without a bot:
 curl -s localhost:8765/v1/info
 curl -s -X POST localhost:8765/v1/reply -H 'Content-Type: application/json' \
   -d '{"room":"dev","text":"hey there"}'
+# -> {"room":"dev","text":"hi!","seconds":1.4,"actions":[{"name":"react","arg":"👋"}]}
+#    `actions` is what the *frontend* should do in the room (see Tools, below)
 
 .venv/bin/python -m sodachat.client --room dev "write me a python function"
 .venv/bin/python -m sodachat.client --room dev --file cat.png "what is this?"
@@ -412,7 +491,11 @@ the first). Run it behind TLS if it leaves the machine.
 2. On the Bot page, enable the **Message Content Intent** (Privileged
    Gateway Intents).
 3. Invite the bot: OAuth2 → URL Generator → scope `bot` → permissions
-   *Send Messages*, *Read Message History* → open the generated URL.
+   *Send Messages*, *Read Message History*, *Add Reactions* → open the
+   generated URL. Everything the bot does by default needs only those; the
+   tools that want *Manage Messages*, *Manage Nicknames*, *Manage Roles* or
+   *Manage Channels* are off until you say otherwise (see
+   [Tools](#tools-reacting-pinning-and-calling-its-own-commands)).
 4. Run it:
 
    ```sh
@@ -451,10 +534,129 @@ specific to a chat room:
   Discord's 2000-character limit is split without leaving a fence unclosed. That
   is the transport's business, not the model's, so it happens here
   ([transport.py](sodachat/transport.py)).
+* **A turn can do something, not just say something** — react to your message,
+  pin it, run one of its own commands. That is the next section.
 
 Generation runs off the event loop, one reply at a time, so the gateway
 heartbeat and the typing indicator keep going while the model writes. Set
 `SODACHAT_AGENT=0` where the models load for the old plain-chat behaviour.
+
+### Tools: reacting, pinning, and calling its own commands
+
+Everything above comes out as words. A server is not only words — a message can
+be reacted to, pinned, split into a thread — and a bot that can only post
+paragraphs sits outside half of how a channel actually talks. So a turn now
+produces two things: the text to post, and the **acts** it wants taken
+([actions.py](sodachat/actions.py)).
+
+```
+you ›  lol that snake run was cursed
+bot ›  😂  (a reaction on your message)
+       "it went where the food was. mostly."
+```
+
+| tool | what it does | on by default |
+|---|---|---|
+| `react` / `unreact <emoji>` | react to a message (*Add Reactions*) | **yes** |
+| `say <text>` | post a message of its own | **yes** |
+| `delete` | take back the last thing **it** said | **yes** |
+| `dm <text>` | answer privately instead | no |
+| `pin` / `unpin` | pin the message being answered (*Manage Messages*) | no |
+| `thread <name>` | start a thread on it (*Create Public Threads*) | no |
+| `nick <name>` | rename **itself** here (*Change Nickname*) | no |
+| `rename <name>` | rename whoever it is answering (*Manage Nicknames*) | no |
+| `role` / `unrole <name>` | give or take a role, by name (*Manage Roles*) | no |
+| `topic <text>` | set the channel topic (*Manage Channels*) | no |
+| `slowmode <seconds>` | set the channel's slowmode (*Manage Channels*) | no |
+| `status <text>` | what it is shown as playing | no |
+
+Turn the rest on per bot, in `.env`:
+
+```sh
+DISCORD_ALLOWED_ACTIONS=react,unreact,say,delete,pin,rename   # or: all, or: none
+```
+
+`rename`, `role` and `unrole` act on **whoever the bot is answering** — the
+model cannot pick someone else, because mentions reach it as the word
+`@someone` with the id scrubbed out ([discord_text.py](sodachat/discord_text.py)),
+which is exactly why that scrubbing is there. Typed by hand the mention *is*
+resolved, so `/rename @bob stinky` renames bob and `/role @bob regular` gives
+them the role. `role` is the one tool here that can hand out power: Discord
+stops a bot assigning anything above its own role, and it ships off.
+
+**What is deliberately missing: kicking, banning, timeouts, and deleting other
+people's messages.** There is no environment variable for them — the refusal is
+the point. Those are punishments and demolition rather than conversation, and a
+14M-parameter model that picks its words by sampling has no business holding
+that end of the stick. `delete` takes back only what the bot itself said.
+
+**The models never touch Discord.** They run in the API server, which holds no
+gateway connection — so a turn *names* an act and the bot process performs it
+([`perform`](sodachat/discord_bot.py)). That split is why the same reply works
+in Google Chat (which has no app-callable reactions: the acts are dropped and
+the words stand alone) and in the terminal, where `/react 🔥` prints what a
+channel would have done. A frontend performs only what
+`DISCORD_ALLOWED_ACTIONS` lists, and an act that fails — missing permission, a
+thread that already exists, an emoji this server doesn't have — is logged with
+the reason and never costs the reply.
+
+**Where the act comes from.** Two paths, and the second one is the honest one:
+
+* **The model asks.** Anything it generates is scanned for a call in double
+  brackets — `[[react :kekw:]]`, `[[pin]]`, and also `[[play snake]]`, because
+  it has the same `/command` list you do. The call is lifted out of the text
+  (you never see the brackets) and the command's output joins the reply. The
+  from-scratch model does not write these yet; the plumbing is here so that
+  *training* it to is the only missing step, and the instruct/gpt2 backends can
+  already stumble into one.
+* **Nothing asked, so a trigger table picks.** `pick_reaction` reads the
+  incoming message — laughter, thanks, a greeting, a *"rip, it's down"* — and
+  falls back to whatever the [routing specialist](#a-routing-specialist-deciding-which-of-them-answers-you)
+  labelled the message (`reason` → 🤔, `codegen` → 💻, `game` → 🎮). This is
+  the same arrangement routing itself was in before `route.py` was trained:
+  hand-written rules standing in for a specialist nobody has trained yet, kept
+  as a table of (pattern → slot) pairs so a reaction specialist could replace
+  `pick_reaction` and nothing else. **Most messages get no reaction**, on
+  purpose — a reaction under every line means nothing.
+
+It can also **keep files**. `/write notes.txt ...`, `/append`, `/read`, `/rm`
+and `/files` work on a folder of the channel's own, and the model reaches for
+them through the same `[[write notes.txt ...]]` call — so "remember that" can
+become a file instead of a promise. That folder is the channel's sandbox, it is
+quota'd, and it goes away when the room is reset: see
+[What a room is allowed to read — and write](#what-a-room-is-allowed-to-read--and-write).
+
+Which emoji a slot picks is the **persona**'s business, like everything else
+about how the bot sounds ([Personality](#personality)): deadpan answers a joke
+with 🙂, ragebaiter with 💀, and a persona that overrides nothing uses the
+default table. `/tools` lists what is available and whether the model may reach
+for it; `/tools off` leaves it to you and your `/react`.
+
+### It reacts to messages you didn't send it
+
+The bot answers DMs and @mentions. It *watches* everything else: a channel is
+mostly people talking to each other, and a bot that only ever reacts to things
+said at it is a bot standing in the corner.
+
+```
+someone ›  the deploy is down again
+   bot   ›  😔        (no reply — just a reaction)
+```
+
+That path is built to be boring, because it runs over every message the bot can
+read:
+
+* **Nothing is generated.** `Rooms.watch` is `pick_reaction` and a persona — one
+  pass over a trigger table, no forward pass, no generation lock. The channel's
+  conversation is neither read nor added to, so watching a room never changes
+  what it says next when you *do* talk to it.
+* **Only reactions can happen unprompted** (`WATCH_ACTS`), whatever the models
+  ask for. A bot that starts posting in conversations it wasn't in is a
+  different and much worse thing to be.
+* **One channel, one reaction, then quiet** for `DISCORD_REACT_COOLDOWN`
+  seconds (default 60) — checked in the bot before the request is sent, so a
+  busy channel costs nothing at all. `DISCORD_WATCH=0` turns the whole thing
+  off.
 
 ## Google Chat
 
@@ -1355,7 +1557,7 @@ data/training/inference lives in its own file below.
 ```
 sodachat/
   corpus.py       # load + clean the NPS Chat corpus
-  data.py         # dialogue dataset loaders (SODA, DailyDialog, NPS) + the
+  data.py         # corpus loaders (SODA, DailyDialog, NPS, Pre-1929 Books) + the
                   #   training text format (tagged turns, plain documents)
   localdata.py    # your own plaintext data in data/: prose -> train.py,
                   #   source -> codegen.py
@@ -1391,10 +1593,14 @@ sodachat/
                   #   of checkpoints, attachment staging, per-room reset
   api.py          # MASTER API SERVER: holds the models, serves every bot
   client.py       # the other end — remote (HTTP) or in-process, same reply()
-  files.py        # which files the agent may open: per-room sandbox for bots,
-                  #   unrestricted only for the terminal the user owns
+  files.py        # which files the agent may open AND write: per-room sandbox for
+                  #   bots, unrestricted reads only for the terminal the user owns,
+                  #   writes always confined to one workspace + quota'd
   transport.py    # chat plumbing with no model imports: code fencing, message
                   #   splitting, attachments, the env switches — what a bot needs
+  actions.py      # what a turn can DO in a room besides talk: the tool vocabulary
+                  #   (react/pin/thread/nick), the [[call]] parser, the reaction
+                  #   picker — named by the models, performed by the frontend
   discord_bot.py  # Discord chat frontend (discord.py), running the full agent
   google_chat.py  # Google Chat frontend (FastAPI webhook), running the full agent
   agent.py        # unified interface: chat (plain text) + /commands for games;
@@ -1407,6 +1613,10 @@ sodachat/
                   #   + versus (multiplayer snake: you vs. the bot, reusing the solo model)
 
 personas.json     # YOUR personalities, merged over the built-in ones
+
+workspace/        # what the TERMINAL agent writes with /write (gitignored,
+                  #   created on first use). A bot writes in its room's sandbox
+                  #   instead, which lives in a temp dir and goes with the room.
 
 data/             # YOUR plaintext training data (optional, see data/README.md)
   text/           #   prose, mixed into the chat model's stream

@@ -13,6 +13,11 @@ clients ([client.py](client.py)) that need neither PyTorch nor a checkpoint.
     google_chat ─┼─ HTTP ─> api.py ─> Rooms ─> SodaAgent per room ─> one model
     your own    ─┘
 
+A reply can also carry **actions** — "react with 🔥", "pin that" ([actions.py](
+actions.py)). This server never performs one: it holds no gateway connection,
+so it names them and the bot that owns the transport does the act. A frontend
+that has no such thing ignores the field.
+
 Rooms are namespaced by the frontend that owns them ("discord:123",
 "googlechat:spaces/AAA"), so two bots on one server never land in each other's
 conversation. Generation stays serialized inside `Rooms`: requests queue on its
@@ -26,7 +31,10 @@ the message being answered. Not another room's files, not the host's.
 Endpoints
     GET  /healthz                whether the models are loaded (unauthenticated)
     GET  /v1/info                device, mode, and what attachments are accepted
-    POST /v1/reply               {room, text, attachments?, reset?} -> {text}
+    POST /v1/reply               {room, text, attachments?, reset?}
+                                     -> {text, actions}
+    POST /v1/watch               {room, text} -> {actions} for a message that
+                                     wasn't addressed to the bot (no generation)
     GET  /v1/rooms               the live conversations
     POST /v1/rooms/reset         {room} -> forget one room (or all of them)
 
@@ -138,10 +146,25 @@ class ReplyRequest(BaseModel):
     reset: bool = False  # start the room over before answering
 
 
+class ActionOut(BaseModel):
+    """One act the reply asks the *frontend* to perform. Kept as a plain
+    name/arg pair rather than a variant per tool: the vocabulary lives in
+    actions.py, and a new tool should not need a schema change here."""
+
+    name: str
+    arg: str = ""
+
+
 class ReplyResponse(BaseModel):
     room: str
     text: str
     seconds: float
+    actions: list[ActionOut] = []
+
+
+class WatchRequest(BaseModel):
+    room: str = Field(min_length=1, max_length=200)
+    text: str = ""
 
 
 class ResetRequest(BaseModel):
@@ -191,14 +214,26 @@ async def reply(request: ReplyRequest) -> ReplyResponse:
     attachments = _decode(request.attachments)
     t0 = time.perf_counter()
     try:
-        text = await live.reply(request.room, request.text, attachments)
+        answer = await live.reply(request.room, request.text, attachments)
     except Exception:
         # The room keeps its state; only this turn is lost. Log the traceback
         # here, where it is useful, and tell the bot something it can post.
         log.exception("failed to answer in room %s", request.room)
         raise HTTPException(500, "the model failed to answer that one") from None
-    return ReplyResponse(room=request.room, text=text,
-                         seconds=round(time.perf_counter() - t0, 3))
+    return ReplyResponse(
+        room=request.room, text=answer.text,
+        seconds=round(time.perf_counter() - t0, 3),
+        actions=[ActionOut(name=a.name, arg=a.arg) for a in answer.actions])
+
+
+@app.post("/v1/watch", dependencies=[Depends(_authorize)])
+async def watch(request: WatchRequest) -> dict:
+    """What to do about a message nobody sent to the bot — a reaction, usually
+    nothing at all. No model runs here and no room is created, so a channel
+    bot can ask this about every message it can see without the cost landing
+    on the models or on this server's generation lock."""
+    actions = _ready().watch(request.room, request.text)
+    return {"actions": [{"name": a.name, "arg": a.arg} for a in actions]}
 
 
 @app.get("/v1/rooms", dependencies=[Depends(_authorize)])
