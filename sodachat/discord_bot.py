@@ -56,7 +56,7 @@ from dotenv import load_dotenv
 from .actions import (TOOLS, WATCH_ACTS, Action, allowed_actions,
                       watch_cooldown, watch_enabled)
 from .client import Backend, BackendError, open_backend
-from .discord_text import clean_incoming
+from .discord_text import clean_incoming, clean_outgoing
 from .transport import DISCORD_LIMIT, Attachment, format_reply, room_id
 
 log = logging.getLogger("sodachat.discord")
@@ -140,6 +140,24 @@ async def _act_unreact(message: discord.Message, arg: str,
 
 async def _act_say(message: discord.Message, arg: str, client: discord.Client) -> None:
     _remember(await message.channel.send(arg))
+
+
+async def _act_ping(message: discord.Message, arg: str, client: discord.Client) -> None:
+    """Ping whoever the turn is about — a real mention, which notifies them.
+
+    The model cannot name anybody: mentions reach it as the bare word
+    "@someone" (discord_text.py), so the target comes off the message exactly
+    as it does for `rename` and `role`. `allowed_mentions` names that one
+    member and nobody else, so a stray `@everyone` in the argument — or in a
+    nickname — cannot turn this into a broadcast.
+    """
+    member = _target(message, client)
+    _remember(await message.channel.send(
+        member.mention,
+        allowed_mentions=discord.AllowedMentions.none().merge(
+            discord.AllowedMentions(users=[member])
+        ),
+    ))
 
 
 async def _act_delete(message: discord.Message, arg: str,
@@ -286,6 +304,7 @@ _ACTS = {
     "react": _act_react,
     "unreact": _act_unreact,
     "say": _act_say,
+    "ping": _act_ping,
     "delete": _act_delete,
     "dm": _act_dm,
     "pin": _act_pin,
@@ -413,7 +432,11 @@ async def reply_to(message: discord.Message, text: str, backend: Backend,
         await message.reply(_OOPS, mention_author=False)
         return
     try:
-        for i, part in enumerate(format_reply(answer.text, DISCORD_LIMIT)):
+        # `@someone` is what an inbound mention looks like to the model, so it
+        # writes the word back — addressing nobody, in grey. It comes out here;
+        # a mention a channel actually sees comes from `[[ping]]` instead.
+        for i, part in enumerate(format_reply(clean_outgoing(answer.text),
+                                              DISCORD_LIMIT)):
             if i == 0:
                 _remember(await message.reply(part, mention_author=False))
             else:

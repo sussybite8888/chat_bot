@@ -273,13 +273,22 @@ class SodaAgent:
     def _use_tools(self, message: str, reply: str) -> str:
         """The tool pass over a finished reply (see actions.py).
 
-        Two things can queue an act. The model can ask for one in the text it
-        generated (`[[react :kekw:]]`), including asking for a `/command` — it
-        has the same list the user does, so "play snake" is one thing the bot
-        can decide to do rather than only something it can be told to do. And
-        when it asked for nothing, `pick_reaction` gets a look at the message:
-        a trigger table standing in for a specialist nobody has trained yet,
-        which answers None for most messages on purpose.
+        Three things can queue an act, in descending order of how much they
+        know. The model can ask for one in the text it generated
+        (`[[react :kekw:]]`), including asking for a `/command` — it has the
+        same list the user does, so "play snake" is one thing the bot can
+        decide to do rather than only something it can be told to do.
+
+        When it asked for nothing, the **tools specialist** (toolgen.py) reads
+        the message and says what it warrants. It is the only thing here that
+        can reach a tool other than `react`: the chat model has never been
+        trained on the call syntax, so in practice the first path only fires
+        for the instruct/gpt2 backends.
+
+        And when that has nothing either, `pick_reaction` gets a look: a
+        trigger table that answers None for most messages on purpose. It stays
+        last rather than being replaced, because it costs one pass over a regex
+        list and works whether or not the specialist is trained.
         """
         if not self.tools:
             # Off means "don't act", not "show your working": a call the model
@@ -297,11 +306,29 @@ class SodaAgent:
             reply = f"{reply}\n{out}".strip() if reply.strip() else out
         if self.pending:
             return reply
+        for act in self._suggested_acts(message):
+            self._queue(act)
+        if self.pending:
+            return reply
         route = (self.last_route[1] if self.last_route is not None
                  and self.last_route[0] == message else None)
         if (emoji := pick_reaction(message, route, self.persona.name)) is not None:
             self._queue(Action("react", emoji))
         return reply
+
+    def _suggested_acts(self, message: str) -> "tuple[Action, ...]":
+        """What the tools specialist makes of the message, or () if it isn't
+        trained. Never raises: a specialist that fails to load or to generate
+        is a bot that acts a little less, not a turn that dies."""
+        try:
+            from .expert import DEFAULT_PATH as EXPERT_PATH
+            from .toolgen import NAME as TOOLS_NAME
+            from .toolgen import suggest
+
+            lm = self._specialist_lm(EXPERT_PATH, TOOLS_NAME)
+            return suggest(lm, message) if lm is not None else ()
+        except Exception:
+            return ()
 
     def watch(self, text: str) -> tuple[Action, ...]:
         """What to do about a message nobody addressed to the bot.

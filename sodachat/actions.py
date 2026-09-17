@@ -28,6 +28,15 @@ visible to the whole channel, and a small model choosing them unprompted is a
 worse failure than a missed reaction — so they ship off, and
 `DISCORD_ALLOWED_ACTIONS` turns them on per server.
 
+`ping` is the one default-on act that is not reversible — a notification cannot
+be unsent. It is on anyway because it needs no elevated permission and because
+the alternative is worse: the model learned the word `@someone` from the corpus
+and will write it whether or not this tool exists, and grey text that addresses
+nobody is a bot that looks broken. With the tool, a mention leaves this process
+only when the model asked for one on purpose, and `discord_text.clean_outgoing`
+scrubs the rest. `WATCH_ACTS` still excludes it, so a message nobody addressed
+to the bot can never earn a ping.
+
 How an action gets chosen
 -------------------------
 Two paths, and they meet here.
@@ -151,6 +160,8 @@ TOOLS: dict[str, Tool] = {
         Tool("thread", "name", "start a thread on the message",
              default_on=False, needs="Create Public Threads", cap=100),
         # --- people -------------------------------------------------------
+        Tool("ping", "", "ping whoever it is answering, for real",
+             default_on=True, needs="Send Messages", aliases=("mention",)),
         Tool("nick", "name", "change its own nickname in this server",
              default_on=False, needs="Change Nickname", cap=32),
         Tool("rename", "name", "rename whoever it is answering",

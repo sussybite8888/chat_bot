@@ -59,6 +59,12 @@ _BLOCKLIST_RE = re.compile(
 _WS_RE = re.compile(r"\s+")  # normalize whitespace
 _HAS_CONTENT_RE = re.compile(r"[A-Za-z0-9]")  # did the user type anything real
 _HAS_LETTER_RE = re.compile(r"[A-Za-z]")  # is a candidate reply actual text
+# A candidate that is nothing but address: "@someone", "@someone, @someone".
+# The corpus is full of the word (it is what a scrubbed Discord mention looks
+# like, see discord_text.py) and the model learned to open with it, but on its
+# own it says nothing — and a frontend that resolves mentions properly would be
+# left with an empty message once the word came out.
+_ADDRESS_ONLY_RE = re.compile(r"^(?:@\w+|[\s,:;.!?-])+$")
 _SENTENCE_RE = re.compile(r"[^.!?]+[.!?]+(?:['\")\]]+)?")  # reply trimming
 
 _NUDGE_LINES = [
@@ -263,6 +269,8 @@ class ChatEngine:
 
     def _acceptable(self, candidate: str, user_text: str) -> bool:
         if not candidate or not _HAS_LETTER_RE.search(candidate):
+            return False
+        if _ADDRESS_ONLY_RE.match(candidate):
             return False
         if len(candidate) > self.reply_length.max_chars:
             return False
