@@ -287,7 +287,7 @@ class InstructPlayer:
 
         device = device or "cpu"
         if device == "cpu":
-            torch.set_num_threads(1)
+            configure_cpu()
         self.model, self.tok = load_checkpoint(path, device)
         self.device = device
         self._nl = self.tok.encode("\n")[0]

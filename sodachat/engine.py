@@ -242,6 +242,25 @@ class ChatEngine:
             self.backend = (backend or os.environ.get("SODACHAT_BACKEND", "mini")).lower()
             self._lm = _load_backend(self.backend, model_path)
 
+    # The two model calls a reply makes, each preferring the batched form. Not
+    # every model reaching this class has one — `lm=` accepts anything with
+    # `generate_line`/`logprob` — so both fall back to looping over the
+    # single-item API, which is exactly what this used to do.
+
+    def _generate(self, prompt: str, temperatures: list[float]) -> list[str]:
+        batched = getattr(self._lm, "generate_lines", None)
+        budget = self.reply_length.max_new_tokens
+        if batched is not None:
+            return batched(prompt, temperatures, max_new_tokens=budget)
+        return [self._lm.generate_line(prompt, temperature=t, max_new_tokens=budget)
+                for t in temperatures]
+
+    def _logprobs(self, context: str, candidates: list[str]) -> list[float]:
+        batched = getattr(self._lm, "logprob_batch", None)
+        if batched is not None:
+            return batched(context, candidates)
+        return [self._lm.logprob(context, c) for c in candidates]
+
     def _acceptable(self, candidate: str, user_text: str) -> bool:
         if not candidate or not _HAS_LETTER_RE.search(candidate):
             return False
@@ -269,16 +288,18 @@ class ChatEngine:
         # so the only way to tell it how B talks is to show it B talking.
         prompt = build_prompt(persona.primer_lines() + kept, text)
 
+        # The candidates are independent samples of one prompt, so they are
+        # sampled as a batch rather than one after another: the model's weights
+        # are read once for all of them instead of once each, which is most of
+        # what a reply costs on a CPU (see `MiniGPT.generate`). The spread of
+        # temperatures is unchanged — it now rides along per row.
+        temperatures = [persona.temperature + 0.05 * (i % 3)
+                        for i in range(_NUM_CANDIDATES)]
+        raw = self._generate(prompt, temperatures)
+
         candidates: list[str] = []
-        for i in range(_NUM_CANDIDATES):
-            candidate = _trim_reply(
-                self._lm.generate_line(
-                    prompt,
-                    temperature=persona.temperature + 0.05 * (i % 3),
-                    max_new_tokens=self.reply_length.max_new_tokens,
-                ),
-                self.reply_length,
-            )
+        for line in raw:
+            candidate = _trim_reply(line, self.reply_length)
             if self._acceptable(candidate, text) and candidate not in candidates:
                 candidates.append(candidate)
         if not candidates:
@@ -287,16 +308,15 @@ class ChatEngine:
 
         # MMI: prefer candidates the conversation makes likely over ones that
         # are simply likely to be said at all. Both sides are scored in the
-        # same bot-turn frame, so only the context differs.
+        # same bot-turn frame, so only the context differs — which is what lets
+        # each side be scored as one batch.
         null = null_prompt()
-        scored = [
-            (
-                candidate,
-                self._lm.logprob(prompt, candidate)
-                - persona.mmi_lambda * self._lm.logprob(null, candidate),
-            )
-            for candidate in candidates
-        ]
+        with_ctx = self._logprobs(prompt, candidates)
+        without = self._logprobs(null, candidates)
+        scored = list(zip(
+            candidates,
+            [a - persona.mmi_lambda * b for a, b in zip(with_ctx, without)],
+        ))
         best, score = max(scored, key=lambda pair: pair[1])
         # Style last: the model can't be talked into a verbal tic, and the
         # repeat check wants the line as it will actually be sent.

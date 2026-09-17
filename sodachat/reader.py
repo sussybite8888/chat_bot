@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blocks import GPTConfig, config_from_payload, make_amp, pick_device
+from .blocks import GPTConfig, config_from_payload, configure_cpu, make_amp, pick_device
 from .model import MiniGPT
 
 DEFAULT_PATH = Path(__file__).resolve().parent.parent / "models" / "reader.pt"
@@ -203,7 +203,7 @@ class Reader:
     def __init__(self, path: Path = DEFAULT_PATH, device=None):
         device = device or "cpu"
         if device == "cpu":
-            torch.set_num_threads(1)
+            configure_cpu()
         ckpt = torch.load(path, map_location=device, weights_only=True)
         self.tok = CharTok(ckpt["charset"])
         self.model = MiniGPT(config_from_payload(ckpt["config"]))

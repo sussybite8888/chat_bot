@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.7")
@@ -34,7 +35,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import GPTConfig, config_from_payload, make_amp, pick_device
+from .blocks import (GPTConfig, config_from_payload, cpu_threads, make_amp,
+                     pick_device)
 from .games.snake import BODY, EMPTY, FOOD, HEAD, SnakeGame
 from .model import MiniGPT
 
@@ -262,8 +264,10 @@ class NarratingPlayer:
 
     def __init__(self, path: Path = DEFAULT_PATH, device=None):
         device = device or "cpu"
-        if device == "cpu":
-            torch.set_num_threads(1)
+        # One thread, scoped to this player's own forwards rather than set on
+        # the process: right for a model this small, wrong for anything sharing
+        # the interpreter with it (see `blocks.cpu_threads`).
+        self._threads = (lambda: cpu_threads(1)) if device == "cpu" else nullcontext
         ckpt = torch.load(path, map_location=device, weights_only=True)
         self.tok = NarrateTokenizer.from_payload(ckpt["tokenizer"])
         self.model = MultiHeadGPT(config_from_payload(ckpt["config"]), ckpt["n_actions"])
@@ -275,6 +279,10 @@ class NarratingPlayer:
 
     @torch.inference_mode()
     def act_and_say(self, game: SnakeGame, temperature=0.7, max_words=40):
+        with self._threads():
+            return self._act_and_say(game, temperature, max_words)
+
+    def _act_and_say(self, game: SnakeGame, temperature=0.7, max_words=40):
         t0 = time.perf_counter()
         ids = self.tok.encode_chars(board_text(game)) + [self.tok.SEP]
         x = torch.tensor([ids], dtype=torch.long, device=self.device)

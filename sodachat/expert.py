@@ -40,9 +40,11 @@ import torch.nn.functional as F
 from .blocks import (
     CausalSelfAttention,
     GPTConfig,
+    KVCache,
     RMSNorm,
     _rope_cache,
     config_from_payload,
+    configure_cpu,
     make_amp,
     make_mlp,
     pick_device,
@@ -91,6 +93,13 @@ class RoutedFFN(nn.Module):
         self.experts = nn.ModuleList(make_mlp(cfg) for _ in range(n_experts))
 
     def forward(self, x: torch.Tensor, task: torch.Tensor) -> torch.Tensor:
+        # Inference routes a whole batch to one task — chat is all TEXT — and
+        # then the mask is pure overhead: a boolean gather to select every row
+        # and a scatter to put it back, per expert, per layer, per token. Take
+        # the expert directly when there is only one in play.
+        first = int(task.reshape(-1)[0])
+        if bool((task == first).all()):
+            return self.experts[first](x).to(x.dtype)
         out = torch.zeros_like(x)
         for e, expert in enumerate(self.experts):
             mask = task == e  # (B, T)
@@ -107,8 +116,8 @@ class ExpertBlock(nn.Module):
         self.ln2 = RMSNorm(cfg.n_embd)
         self.ffn = RoutedFFN(cfg, n_experts)  # per-task
 
-    def forward(self, x, cos, sin, task) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin)
+    def forward(self, x, cos, sin, task, cache=None, layer: int = 0) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), cos, sin, cache=cache, layer=layer)
         return x + self.ffn(self.ln2(x), task)
 
 
@@ -147,43 +156,92 @@ class ExpertGPT(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def _rope_for(self, T, device, dtype):
+    def _rope_for(self, T, device, dtype, offset: int = 0):
+        """Rotation factors for `T` positions starting at absolute `offset` —
+        see `MiniGPT._rope_for`. The offset is what lets a KV cache be correct:
+        a token must be rotated by its own absolute angle whether it arrived in
+        the prompt or alone as the next step."""
         key = (device, dtype)
         c = self._rope.get(key)
-        if c is None or c[0].shape[0] < T:
-            c = _rope_cache(max(T, self.cfg.block_size),
+        need = offset + T
+        if c is None or c[0].shape[0] < need:
+            c = _rope_cache(max(need, self.cfg.block_size),
                             self.cfg.n_embd // self.cfg.n_head,
                             self.cfg.rope_theta, device, dtype)
             self._rope[key] = c
-        return c[0][:T], c[1][:T]
+        return c[0][offset:need], c[1][offset:need]
 
-    def _features(self, idx: torch.Tensor, task: torch.Tensor) -> torch.Tensor:
+    def _features(self, idx: torch.Tensor, task: torch.Tensor,
+                  cache=None) -> torch.Tensor:
         """The shared trunk: embeddings -> routed blocks -> final norm. Every
         head (LM, action, specialist) reads from this."""
         x = self.drop(self.tok_emb(idx))
-        cos, sin = self._rope_for(idx.shape[1], x.device, x.dtype)
-        for block in self.blocks:
-            x = block(x, cos, sin, task)
+        n_past = cache.n_past if cache is not None else 0
+        cos, sin = self._rope_for(idx.shape[1], x.device, x.dtype, offset=n_past)
+        for i, block in enumerate(self.blocks):
+            x = block(x, cos, sin, task, cache=cache, layer=i)
         return self.ln_f(x)
 
-    def forward(self, idx: torch.Tensor, task: torch.Tensor):
-        """idx, task: (B, T). Returns (lm_logits [B,T,V], action_logits [B,T,A])."""
-        x = self._features(idx, task)
+    def forward(self, idx: torch.Tensor, task: torch.Tensor, cache=None,
+                last_only: bool = False):
+        """idx, task: (B, T). Returns (lm_logits [B,T,V], action_logits [B,T,A]).
+
+        `last_only` keeps just the final position, which is all sampling reads —
+        the LM head is a 512x10001 matmul and running a whole prompt through it
+        to use one row of the answer is the single most wasteful thing in a
+        decode loop."""
+        x = self._features(idx, task, cache=cache)
+        if last_only:
+            x = x[:, -1:, :]
         return self.lm_head(x), self.action_head(x)
 
     @torch.no_grad()
     def generate_text(self, idx, task_id, max_new_tokens, temperature=0.8,
                       top_k=40, top_p=None, repetition_penalty=1.0,
-                      frequency_penalty=0.0, stop_tokens=()):
+                      frequency_penalty=0.0, stop_tokens=(), use_cache=True,
+                      shared_prompt=False, return_lengths=False):
         """Autoregressive text from the LM head, every token routed to `task_id`'s
-        expert (TEXT for chat/read). Games don't use this — see `move_logits`."""
-        stop = set(stop_tokens)
-        start = idx.shape[1]
-        for _ in range(max_new_tokens):
-            cond = idx[:, -self.cfg.block_size:]
-            task = torch.full_like(cond, task_id)
-            logits = warp_logits(
-                self(cond, task)[0][:, -1, :],
+        expert (TEXT for chat/read). Games don't use this — see `move_logits`.
+
+        Two things make this cheap, both of which this loop used to do without:
+
+        * **A KV cache.** Without one every step re-encodes the entire window
+          from scratch, so a reply costs time quadratic in its length — and this
+          model's window is 1024, four times the mini model's, so it had four
+          times as much to redo. With the cache the prompt is encoded once and
+          each later token computes only its own row.
+        * **Batching.** `idx` may carry B independent rows (and a (B,) tensor of
+          temperatures), so a batch of candidate replies reads the weights once
+          between them instead of once each — the difference between a
+          bandwidth-bound GEMV and a GEMM the vector units can fill.
+
+        `shared_prompt` prefills once when every row starts from the same
+        prompt; `return_lengths` gives back where each row hit a stop token,
+        since rows in a batch finish at different steps.
+        """
+        B, start = idx.shape[0], idx.shape[1]
+        window = self.cfg.block_size
+        device = idx.device
+        stop = (torch.tensor(sorted(set(stop_tokens)), device=device)
+                if stop_tokens else None)
+
+        def run(tokens, cache):
+            return self(tokens, torch.full_like(tokens, task_id), cache=cache,
+                        last_only=True)[0]
+
+        cache = KVCache(len(self.blocks), max_len=window) if use_cache else None
+        if shared_prompt and cache is not None and B > 1:
+            logits = run(idx[:1, -window:], cache)
+            cache.expand_to(B)
+            logits = logits.expand(B, -1, -1).contiguous()
+        else:
+            logits = run(idx[:, -window:], cache)
+
+        done = torch.zeros(B, dtype=torch.bool, device=device)
+        lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=device)
+        for step in range(max_new_tokens):
+            warped = warp_logits(
+                logits[:, -1, :],
                 idx[:, start:],  # penalize only what this call generated
                 temperature,
                 top_k=top_k,
@@ -191,12 +249,26 @@ class ExpertGPT(nn.Module):
                 repetition_penalty=repetition_penalty,
                 frequency_penalty=frequency_penalty,
             )
-            probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, 1)
+            nxt = torch.multinomial(F.softmax(warped, dim=-1), 1)
             idx = torch.cat([idx, nxt], dim=1)
-            if nxt.item() in stop:
-                break
-        return idx
+            if stop is not None:
+                hit = (nxt == stop).any(dim=-1)
+                lengths = torch.where(hit & ~done, step, lengths)
+                done |= hit
+                if bool(done.all()):
+                    break
+            if step == max_new_tokens - 1:
+                break  # nothing would read the next logits
+            if cache is None:
+                logits = run(idx[:, -window:], None)
+            elif cache.n_past < window:
+                logits = run(nxt, cache)
+            else:
+                # Window full: restart the cache on the trailing window, so RoPE
+                # is never asked to extrapolate past the trained context.
+                cache = KVCache(len(self.blocks), max_len=window)
+                logits = run(idx[:, -window:], cache)
+        return (idx, lengths) if return_lengths else idx
 
     @torch.no_grad()
     def move_logits(self, idx):
@@ -768,7 +840,7 @@ class ExpertLM:
     def __init__(self, path=DEFAULT_PATH, device=None, specialists="auto"):
         device = device or "cpu"
         if device == "cpu":
-            torch.set_num_threads(1)
+            configure_cpu()
         self.model, self.tok, self.actions = load(path, device)
         self.device = device
         if specialists == "auto":
@@ -815,6 +887,23 @@ class ExpertLM:
                                        stop_tokens=[self._nl, self._end])
         return self.tok.decode(out[0][idx.shape[1]:].tolist())
 
+    def _gen_many(self, prompt, task_id, max_new, temperatures, top_p=None,
+                  repetition_penalty=1.0):
+        """`_gen` for several samples of one prompt, in a single batched pass."""
+        ids = self.tok.encode(prompt)[-self.block:]
+        n = len(temperatures)
+        idx = torch.tensor([ids], dtype=torch.long,
+                           device=self.device).expand(n, -1).contiguous()
+        out, lengths = self.model.generate_text(
+            idx, task_id, max_new,
+            torch.tensor(list(temperatures), dtype=torch.float32, device=self.device),
+            top_k=40, top_p=top_p, repetition_penalty=repetition_penalty,
+            stop_tokens=[self._nl, self._end], shared_prompt=True,
+            return_lengths=True)
+        start = len(ids)
+        return [self.tok.decode(out[b, start:start + int(lengths[b])].tolist())
+                for b in range(n)]
+
     def chat(self, history: list[str], message: str, temperature=0.8) -> str:
         turns = [*history, message]
         lines = [f"{'AB'[(len(turns) - 1 - i) % 2]}: {t}" for i, t in enumerate(turns)]
@@ -834,25 +923,51 @@ class ExpertLM:
                          top_p=_CHAT_TOP_P,
                          repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
 
-    @torch.no_grad()
+    def generate_lines(self, prompt: str, temperatures, max_new_tokens=None) -> list[str]:
+        """`generate_line` for a whole set of candidates at once — see
+        `MiniChatLM.generate_lines`, which this mirrors so that `ChatEngine`
+        gets the batched path whichever model it is wrapping."""
+        max_new = CHAT_MAX_NEW_TOKENS if max_new_tokens is None else max(1, max_new_tokens)
+        return [t.strip() for t in
+                self._gen_many(f"{CHAT}\n" + prompt, TEXT, max_new, temperatures,
+                               top_p=_CHAT_TOP_P,
+                               repetition_penalty=_CHAT_REPETITION_PENALTY)]
+
+    @torch.inference_mode()
     def logprob(self, context: str, continuation: str) -> float:
         """Mean per-token log-prob of `continuation` as a bot chat line, given
         `context` — for MMI reranking. Routed to the TEXT expert."""
+        return self.logprob_batch(context, [continuation])[0]
+
+    @torch.inference_mode()
+    def logprob_batch(self, context: str, continuations) -> list[float]:
+        """`logprob` for every candidate against one context, in one pass — see
+        `MiniChatLM.logprob_batch`. Right-padding is safe under causal
+        attention; the padded positions are dropped from each row's mean."""
         ctx = self.tok.encode(f"{CHAT}\n" + context) or [self._nl]
-        cont = self.tok.encode(" " + continuation.strip() + "\n")
-        if not cont:
-            return float("-inf")
-        overflow = len(ctx) + len(cont) - self.block
+        conts = [self.tok.encode(" " + c.strip() + "\n") for c in continuations]
+        width = max((len(c) for c in conts), default=0)
+        if not width:
+            return [float("-inf")] * len(conts)
+        # Trimmed to fit the longest candidate, so every candidate is scored
+        # against an identical context and the scores stay comparable.
+        overflow = len(ctx) + width - self.block
         if overflow > 0:  # trim old context, never the continuation
             ctx = ctx[overflow:] or [self._nl]
-        ids = torch.tensor([ctx + cont], dtype=torch.long, device=self.device)
+        rows = [ctx + c + [self._nl] * (width - len(c)) for c in conts]
+        ids = torch.tensor(rows, dtype=torch.long, device=self.device)
         inp = ids[:, :-1]  # predict each continuation token from its predecessor
         task = torch.full_like(inp, TEXT)  # whole doc is a chat doc
         logits = self.model(inp, task)[0]  # lm_head logits only
-        logprobs = F.log_softmax(logits[0], dim=-1)
-        targets = ids[0, len(ctx):]
-        picked = logprobs[len(ctx) - 1:].gather(1, targets.unsqueeze(1))
-        return float(picked.mean())
+        targets = ids[:, 1:]
+        picked = (logits.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+                  - logits.logsumexp(-1))
+        scored = picked[:, len(ctx) - 1:]
+        keep = (torch.arange(width, device=self.device)[None, :]
+                < torch.tensor([len(c) for c in conts], device=self.device)[:, None])
+        totals = (scored * keep).sum(-1) / keep.sum(-1).clamp_min(1)
+        return [float(t) if len(c) else float("-inf")
+                for t, c in zip(totals, conts)]
 
     def read(self, fields: dict, question: str) -> str:
         from .reader import state_block

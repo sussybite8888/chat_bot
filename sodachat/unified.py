@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .blocks import BPETokenizer, GPTConfig, make_amp, pick_device
+from .blocks import BPETokenizer, GPTConfig, configure_cpu, make_amp, pick_device
 from .model import (
     _CHAT_REPETITION_PENALTY,
     _CHAT_TOP_P,
@@ -241,7 +241,7 @@ class UnifiedLM:
 
         device = device or "cpu"
         if device == "cpu":
-            torch.set_num_threads(1)
+            configure_cpu()
         self.model, self.tok = load_checkpoint(path, device)
         self.device = device
         self._nl = self.tok.encode("\n")[0]
@@ -278,24 +278,60 @@ class UnifiedLM:
                          [self._nl, self._end], top_p=_CHAT_TOP_P,
                          repetition_penalty=_CHAT_REPETITION_PENALTY).strip()
 
-    @torch.no_grad()
+    def generate_lines(self, prompt: str, temperatures, max_new_tokens=None) -> list[str]:
+        """`generate_line` for a whole set of candidates at once — see
+        `MiniChatLM.generate_lines`, which this mirrors so that `ChatEngine`
+        gets the batched path whichever model it is wrapping."""
+        max_new = CHAT_MAX_NEW_TOKENS if max_new_tokens is None else max(1, max_new_tokens)
+        ids = self.tok.encode(f"{CHAT}\n" + prompt)[-self.model.cfg.block_size:]
+        n = len(temperatures)
+        idx = torch.tensor([ids], dtype=torch.long,
+                           device=self.device).expand(n, -1).contiguous()
+        out, lengths = self.model.generate(
+            idx, max_new_tokens=max_new,
+            temperature=torch.tensor(list(temperatures), dtype=torch.float32,
+                                     device=self.device),
+            top_k=40, top_p=_CHAT_TOP_P,
+            repetition_penalty=_CHAT_REPETITION_PENALTY,
+            stop_tokens=[self._nl, self._end], shared_prompt=True,
+            return_lengths=True)
+        start = len(ids)
+        return [self.tok.decode(out[b, start:start + int(lengths[b])].tolist()).strip()
+                for b in range(n)]
+
+    @torch.inference_mode()
     def logprob(self, context: str, continuation: str) -> float:
         """Mean per-token log-prob of `continuation` as a bot chat line, given
         `context` — for MMI reranking."""
+        return self.logprob_batch(context, [continuation])[0]
+
+    @torch.inference_mode()
+    def logprob_batch(self, context: str, continuations) -> list[float]:
+        """`logprob` for every candidate against one context, in one pass — see
+        `MiniChatLM.logprob_batch`. Right-padding is safe under causal
+        attention; the padded positions are dropped from each row's mean."""
         ctx = self.tok.encode(f"{CHAT}\n" + context) or [self._nl]
-        cont = self.tok.encode(" " + continuation.strip() + "\n")
-        if not cont:
-            return float("-inf")
-        block = self.model.cfg.block_size
-        overflow = len(ctx) + len(cont) - block
+        conts = [self.tok.encode(" " + c.strip() + "\n") for c in continuations]
+        width = max((len(c) for c in conts), default=0)
+        if not width:
+            return [float("-inf")] * len(conts)
+        # Trimmed to fit the longest candidate, so every candidate is scored
+        # against an identical context and the scores stay comparable.
+        overflow = len(ctx) + width - self.model.cfg.block_size
         if overflow > 0:  # trim old context, never the continuation
             ctx = ctx[overflow:] or [self._nl]
-        ids = torch.tensor([ctx + cont], dtype=torch.long, device=self.device)
+        rows = [ctx + c + [self._nl] * (width - len(c)) for c in conts]
+        ids = torch.tensor(rows, dtype=torch.long, device=self.device)
         logits, _ = self.model(ids[:, :-1])
-        logprobs = F.log_softmax(logits[0], dim=-1)
-        targets = ids[0, len(ctx):]
-        picked = logprobs[len(ctx) - 1:].gather(1, targets.unsqueeze(1))
-        return float(picked.mean())
+        targets = ids[:, 1:]
+        picked = (logits.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+                  - logits.logsumexp(-1))
+        scored = picked[:, len(ctx) - 1:]
+        keep = (torch.arange(width, device=self.device)[None, :]
+                < torch.tensor([len(c) for c in conts], device=self.device)[:, None])
+        totals = (scored * keep).sum(-1) / keep.sum(-1).clamp_min(1)
+        return [float(t) if len(c) else float("-inf")
+                for t, c in zip(totals, conts)]
 
     def read(self, fields: dict, question: str) -> str:
         from .reader import state_block

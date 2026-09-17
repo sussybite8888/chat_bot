@@ -110,6 +110,48 @@ The engine ([engine.py](sodachat/engine.py)) wraps that with:
 - **Output filtering** — a profanity filter is applied to replies by default.
   Disable with `--unfiltered` (CLI) or `SODACHAT_UNFILTERED=1`.
 
+### Replying fast on a CPU
+
+The models run on CPU by default (`SODACHAT_DEVICE`), and a reply is a lot of
+small work: 12 sampled candidates, then 24 scoring passes to rank them. What
+makes that slow is not the arithmetic — it is *reading the weights*. Decoding
+one token for one candidate touches every parameter in the model (~300MB for
+the chat model) to produce a single token's worth of output, so the machine
+runs at memory bandwidth with its vector units mostly idle.
+
+So the engine does everything it can in batches, which is the difference
+between a matrix-vector product and a matrix-matrix one:
+
+- **Candidates are sampled together**, not one after another
+  (`generate_lines`). The weights are read once for all twelve instead of
+  twelve times, and the per-token matmuls get wide enough for the vector units
+  to fill. Measured on the chat model: 7.7 ms/token at batch 1 against
+  1.28 ms/token at batch 12.
+- **The prompt is prefilled once** and the attention cache broadcast across the
+  candidates — they all continue the same conversation. (The browser port
+  worked this out first; see [In the browser](#in-the-browser-onnx-runtime-web).)
+- **MMI scoring is two batched passes**, one against the conversation and one
+  against nothing, rather than two passes per candidate.
+- **The LM head runs on the last position only** while sampling. It is the
+  widest matmul in the model, and a decode step reads exactly one row of it.
+- **The attention cache is a preallocated buffer**, not a `torch.cat` per step,
+  which otherwise recopies the whole run every token.
+
+Threading is left at one thread per physical core. Both extremes cost: pinning
+to one thread gives up every core but one, and going past the physical count is
+far worse — on a hybrid P/E-core Intel part, 20 threads over 14 cores measured
+~30x *slower* than 14. `SODACHAT_THREADS` overrides if the box is shared.
+
+End to end, on one 13th-gen Intel i7 with 4 threads:
+
+| chat path | before | after |
+|---|---|---|
+| `mini` backend (76.9M params) | 2.8 s/reply | 1.1 s/reply |
+| `expert` mode, the agent default (48M params, 1024 window) | 4.5 s/reply | 0.6 s/reply |
+
+The expert model gains most because its sampling loop had no attention cache at
+all and re-encoded a 1024-token window every token.
+
 ## Setup
 
 ```sh
@@ -749,12 +791,14 @@ quarter at some quality cost. The chat UI needs only `chat.onnx`.
 out, all of them forced by the browser, and all explained at the top of
 [export_onnx.py](sodachat/export_onnx.py):
 
-- **A KV cache.** `MiniGPT.generate` re-runs the whole context per token, which
-  is fine on a GPU and hopeless in WASM — a reply is 12 candidates × 48 tokens,
+- **A KV cache.** Without one every token re-runs the whole context, which is
+  fine on a GPU and hopeless in WASM — a reply is 12 candidates × 48 tokens,
   and at ~3 GFLOP per uncached pass that is minutes of arithmetic. The exported
   graphs take the attention cache in and hand it back grown, so a token costs
   ~30 MFLOP. The prompt is identical across a reply's 12 candidates, so the
-  engine prefills once and *forks* that cache per candidate.
+  engine prefills once and *forks* that cache per candidate. (Python does both
+  of these too now — see [Replying fast on a CPU](#replying-fast-on-a-cpu).
+  This was the first place the trick was needed, not the only one.)
 - **Explicit attention.** `F.scaled_dot_product_attention` has no counterpart in
   the ORT web build, so the export spells it out as matmul/softmax.
 - **One graph per task, not one routed graph.** `RoutedFFN` picks an expert per
@@ -1508,7 +1552,9 @@ median, and the standard deviation is ~0.1 ms. That steadiness is engineered:
 the model is warmed up before the loop (so kernel compilation isn't an
 in-game outlier), the input tensor is reused, the cyclic garbage collector is
 paused during play (its pauses were a systematic multi-ms spike source), and
-it runs single-threaded on CPU. The GPU is counter-intuitively worse for a
+it runs single-threaded on CPU — scoped to its own forward passes, since the
+thread count is a process-wide setting and a chat model sharing the
+interpreter wants every core it can get. The GPU is counter-intuitively worse for a
 model this small — async kernel-launch variance gives it a much heavier tail
 (occasional tens-of-ms spikes) — so play defaults to CPU. Because the board is
 fixed-size, the sequence length, and thus the work per move, is constant.

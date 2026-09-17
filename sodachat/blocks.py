@@ -21,19 +21,98 @@ The models assembled from these:
 
 from __future__ import annotations
 
+import contextlib
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Torch's own default thread count, which is one per *physical* core. Captured
+# at import, before any model's load path can change it, so `configure_cpu`
+# still knows the machine's real width after something has pinned the process.
+_PHYSICAL_THREADS = torch.get_num_threads()
+_cpu_configured = False
+
 
 def pick_device() -> str:
+    """The device models load onto.
+
+    `SODACHAT_DEVICE` wins when set — it is the deployment knob (see
+    .env.example), and a box with a GPU it does not want the bot using is the
+    normal reason to set it. Otherwise prefer an accelerator."""
+    env = os.environ.get("SODACHAT_DEVICE", "").strip().lower()
+    if env:
+        return env
     if torch.backends.mps.is_available():
         return "mps"
     if torch.cuda.is_available():
         return "cuda"
     return "cpu"
+
+
+def configure_cpu(threads: int | None = None) -> int:
+    """Tune this process for CPU inference. Idempotent; returns the thread count.
+
+    Every knob here is process-global, which is why this is one function called
+    from the model load paths rather than a setting carried on each model — two
+    models in one process cannot disagree about it.
+
+    * **Threads.** Torch already defaults to one per physical core, which is the
+      right answer; both extremes are expensive. Pinning to 1 gives up every
+      core but one (~2.5x on the measured chat model). Oversubscribing is far
+      worse: on a hybrid Intel part, 20 threads across 14 physical cores
+      measured **~30x slower** than 14, because the OpenMP barrier closing every
+      GEMM ends up waiting on threads the scheduler has parked. So the default
+      is left alone and an explicit request is clamped to the physical count.
+    * **Denormals.** Attention tails and softcapped logits drift into denormal
+      range, and a denormal operand drops the vector units onto a microcode
+      path costing ~100x a normal FMA. Flushing to zero keeps every kernel on
+      the fast SIMD path; the values involved are already numerically nothing.
+    * **oneDNN.** The fused AVX2/AVX-512 (and NEON) kernels behind `nn.Linear`
+      and SDPA — where the SIMD actually happens. On by default; asserted here
+      so a stray disable elsewhere cannot quietly cost a factor of two.
+
+    `SODACHAT_THREADS` overrides, for sharing a box with something else.
+    """
+    global _cpu_configured
+    if _cpu_configured and threads is None:
+        return torch.get_num_threads()
+    if threads is None:
+        env = os.environ.get("SODACHAT_THREADS", "").strip()
+        threads = int(env) if env.isdigit() and int(env) > 0 else _PHYSICAL_THREADS
+    torch.set_num_threads(max(1, min(int(threads), _PHYSICAL_THREADS)))
+    # Inter-op parallelism is a second thread pool over *independent* ops. The
+    # decode loop is a chain of dependent matmuls, so there is nothing for it to
+    # overlap; leaving it wide only lets it compete with the intra-op pool.
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass  # already started — only settable once per process
+    torch.set_flush_denormal(True)
+    torch.backends.mkldnn.enabled = True
+    _cpu_configured = True
+    return torch.get_num_threads()
+
+
+@contextlib.contextmanager
+def cpu_threads(n: int):
+    """Run a block at a different intra-op thread count, then restore it.
+
+    The thread count is process-global, but the right value is not: a ~1M-param
+    game model wants one thread (a thread pool costs more than the work it
+    splits), while the ~77M chat model wants every core. Before this was scoped,
+    whichever loaded last decided for both — so playing one round of a game left
+    every later chat reply pinned to a single core."""
+    prev = torch.get_num_threads()
+    if n != prev:
+        torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        if n != prev:
+            torch.set_num_threads(prev)
 
 
 class _Amp:
@@ -98,8 +177,6 @@ def make_amp(device: str, enabled: bool | None = None) -> _Amp:
     Auto-enables on CUDA only, choosing bf16 where the GPU supports it (no loss
     scaling needed) and fp16 otherwise. `SODACHAT_NO_AMP=1` forces full precision;
     pass `enabled=` to override explicitly."""
-    import os
-
     if enabled is None:
         enabled = device == "cuda" and os.environ.get("SODACHAT_NO_AMP") != "1"
     dtype = torch.float16
@@ -138,7 +215,7 @@ def warp_logits(
        already in `seq` is divided by `repetition_penalty` if positive, else
        multiplied by it, so >1 discourages repeats. This is what tames the
        word-looping small models fall into; 1.0 is a no-op.
-    3. **Temperature.**
+    3. **Temperature** — a scalar, or a (B,) tensor for a per-row temperature.
     4. **Top-k**, then **nucleus (top-p)** — top-p keeps the smallest set of
        most-likely tokens whose mass reaches `top_p`, a softer tail cut than a
        fixed k. Filtered entries are set to -inf; the caller softmaxes.
@@ -172,13 +249,24 @@ def warp_logits(
         counts.scatter_add_(1, window, torch.ones_like(window, dtype=logits.dtype))
         logits -= frequency_penalty * counts
     if repetition_penalty != 1.0 and seq is not None and seq.numel():
-        for b in range(seq.shape[0]):
-            ids = torch.unique(seq[b])
-            picked = logits[b, ids]
-            logits[b, ids] = torch.where(
-                picked > 0, picked / repetition_penalty, picked * repetition_penalty
-            )
-    logits = logits / max(temperature, 1e-5)
+        # Presence of each id in the row's own history, as a (B, V) mask. This
+        # says exactly what a per-row `torch.unique` said, without the Python
+        # loop over the batch — which mattered once candidates are sampled as a
+        # batch, since that loop ran per row per generated token.
+        present = torch.zeros_like(logits, dtype=torch.bool)
+        present.scatter_(1, seq, True)
+        logits = torch.where(
+            present,
+            torch.where(logits > 0, logits / repetition_penalty,
+                        logits * repetition_penalty),
+            logits,
+        )
+    if torch.is_tensor(temperature):
+        # Per-row temperature: the candidates in a batch are deliberately
+        # sampled at slightly different temperatures (see ChatEngine.reply).
+        logits = logits / temperature.to(logits.dtype).clamp_min(1e-5).unsqueeze(-1)
+    else:
+        logits = logits / max(temperature, 1e-5)
     if top_k:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         logits[logits < v[:, [-1]]] = -float("inf")
@@ -347,11 +435,19 @@ class RMSNorm(nn.Module):
 def _rope_cache(
     seq_len: int, head_dim: int, theta: float, device, dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    freqs = 1.0 / (
-        theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
-    )
-    angles = torch.outer(torch.arange(seq_len, device=device).float(), freqs)
-    return angles.cos().to(dtype), angles.sin().to(dtype)
+    # Built with inference mode explicitly off. These angles are cached on the
+    # model and outlive the call that first asked for them, so if the first
+    # caller happened to be a sampling loop (which runs under
+    # `torch.inference_mode`) they would be *inference tensors* — and a later
+    # autograd-tracked forward on the same model instance would then fail with
+    # "Inference tensors cannot be saved for backward". Nothing here is
+    # differentiable, so opting out costs nothing.
+    with torch.inference_mode(False):
+        freqs = 1.0 / (
+            theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+        )
+        angles = torch.outer(torch.arange(seq_len, device=device).float(), freqs)
+        return angles.cos().to(dtype), angles.sin().to(dtype)
 
 
 def rms_normalize(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -387,25 +483,70 @@ class KVCache:
     absolute position at write time and attention reads out the difference:
     as long as every new token is rotated at its own absolute index (see
     `MiniGPT._rope_for`'s `offset`), relative distances stay correct.
+
+    Storage is a **preallocated** buffer per layer, written in place, rather
+    than a `torch.cat` per step. Concatenating reallocates and recopies the
+    whole run every token, so the bytes moved over a reply grow with the square
+    of its length — at the chat model's size that was a few hundred MB of pure
+    memcpy per step, competing for the same memory bandwidth the weights need.
+    `max_len` (the block size, which generation can never exceed) sizes the
+    buffer once up front; without it the buffer doubles as it grows.
     """
 
-    def __init__(self, n_layer: int):
+    def __init__(self, n_layer: int, max_len: int | None = None):
         self.k: list[torch.Tensor | None] = [None] * n_layer
         self.v: list[torch.Tensor | None] = [None] * n_layer
+        # Positions written per layer. Kept explicitly because the buffer's own
+        # length is now its capacity, not its contents.
+        self._fill = [0] * n_layer
+        self.max_len = max_len
 
     @property
     def n_past(self) -> int:
         """How many positions are already cached (0 before the prefill)."""
-        return 0 if self.k[0] is None else self.k[0].shape[-2]
+        return self._fill[0]
+
+    def _reserve(self, layer: int, k: torch.Tensor, need: int) -> None:
+        buf = self.k[layer]
+        if buf is not None and buf.shape[-2] >= need:
+            return
+        B, H, _, D = k.shape
+        cap = max(need, self.max_len or 0, 2 * (buf.shape[-2] if buf is not None else 0))
+        new_k, new_v = k.new_empty((B, H, cap, D)), k.new_empty((B, H, cap, D))
+        if buf is not None:
+            n = self._fill[layer]
+            new_k[..., :n, :] = buf[..., :n, :]
+            new_v[..., :n, :] = self.v[layer][..., :n, :]
+        self.k[layer], self.v[layer] = new_k, new_v
 
     def update(self, layer: int, k: torch.Tensor,
                v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Append this step's keys/values for `layer` and return the full run."""
-        if self.k[layer] is not None:
-            k = torch.cat([self.k[layer], k], dim=-2)
-            v = torch.cat([self.v[layer], v], dim=-2)
-        self.k[layer], self.v[layer] = k, v
-        return k, v
+        n, T = self._fill[layer], k.shape[-2]
+        self._reserve(layer, k, n + T)
+        self.k[layer][..., n:n + T, :] = k
+        self.v[layer][..., n:n + T, :] = v
+        self._fill[layer] = n + T
+        # A narrow on the position axis, so nothing is copied out. The result
+        # is still a batch of matrices with a regular leading stride, which is
+        # what the BLAS/oneDNN attention kernels want.
+        return self.k[layer][..., :n + T, :], self.v[layer][..., :n + T, :]
+
+    def expand_to(self, batch: int) -> None:
+        """Broadcast a batch-1 cache across `batch` rows.
+
+        Sampling several candidate replies means running one prompt as a batch,
+        and every row's prompt is identical — so the prefill is done once and
+        its cache copied out here, rather than paying for the same prompt B
+        times. Only the filled region is copied, not the reserved capacity."""
+        for i, k in enumerate(self.k):
+            if k is None or k.shape[0] == batch:
+                continue
+            n, (_, H, cap, D) = self._fill[i], k.shape
+            new_k, new_v = k.new_empty((batch, H, cap, D)), k.new_empty((batch, H, cap, D))
+            new_k[..., :n, :] = k[..., :n, :]
+            new_v[..., :n, :] = self.v[i][..., :n, :]
+            self.k[i], self.v[i] = new_k, new_v
 
 
 class CausalSelfAttention(nn.Module):

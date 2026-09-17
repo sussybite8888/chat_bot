@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,7 @@ import torch.nn.functional as F
 # for callers that predate blocks.py. New code should import them from .blocks.
 from .blocks import (  # noqa: F401
     Block,
+    configure_cpu,
     BPETokenizer,
     CharTokenizer,
     GPTConfig,
@@ -169,7 +171,17 @@ class MiniGPT(nn.Module):
         targets: torch.Tensor | None = None,
         doc_ids: torch.Tensor | None = None,
         cache: KVCache | None = None,
+        last_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """`last_only` returns logits for the final position alone.
+
+        Sampling reads exactly one row of the logits — the last — but the head
+        is the widest matmul in the model (n_embd x vocab, and tied, so it is
+        also the largest weight). Projecting a whole prompt through it during
+        the prefill computes a full vocabulary distribution for every token of
+        the context and then throws all but one away. Scoring (`logprob`) and
+        training do read every position, so this stays opt-in.
+        """
         B, T = idx.shape
         x = self.drop(self.tok_emb(idx))
         n_past = cache.n_past if cache is not None else 0
@@ -177,6 +189,8 @@ class MiniGPT(nn.Module):
         attn_mask = None if doc_ids is None else self._doc_mask(doc_ids, T)
         for i, block in enumerate(self.blocks):
             x = block(x, cos, sin, attn_mask, cache=cache, layer=i)
+        if last_only and targets is None:
+            x = x[:, -1:, :]
         logits = self.head(self.ln_f(x))
         if self.cfg.logit_softcap:
             # Squash logits into (-cap, cap). A from-scratch model will happily
@@ -195,7 +209,7 @@ class MiniGPT(nn.Module):
             )
         return logits, loss
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(
         self,
         idx: torch.Tensor,
@@ -207,21 +221,59 @@ class MiniGPT(nn.Module):
         frequency_penalty: float = 0.0,
         stop_tokens: list[int] | None = None,
         use_cache: bool = True,
-    ) -> torch.Tensor:
-        """Sample a continuation of `idx`.
+        shared_prompt: bool = False,
+        return_lengths: bool = False,
+    ):
+        """Sample a continuation of `idx` — one row, or a whole batch of them.
 
         With `use_cache` the prompt is encoded once and each later token costs
         a single-position forward rather than another pass over the whole
         window — the same arithmetic, minus the part that was already done.
         `use_cache=False` keeps the plain re-encode loop, which is what the
         cached path is checked against.
+
+        **Batching.** `idx` may carry B rows, each sampled independently: rows
+        get their own `stop_tokens` handling and, if `temperature` is a (B,)
+        tensor, their own temperature. This is the difference between a GEMV
+        and a GEMM. Decoding one row reads all ~300MB of weights to produce a
+        single token, so it runs at memory bandwidth with the vector units
+        mostly idle; B rows read those same weights once and do B times the
+        arithmetic with them, so the SIMD units have something to chew on.
+        Measured on the chat model: 7.7 ms/token at B=1 against 1.28 ms/token
+        at B=12 — the same work, six times cheaper per token.
+
+        `shared_prompt` says every row starts from the same prompt (candidate
+        replies to one message), so the prefill runs once on one row and the
+        cache is broadcast, instead of encoding B identical copies.
+
+        `return_lengths` gives back `(idx, lengths)`, where `lengths[b]` is how
+        many tokens row `b` produced before it hit a stop token — rows finish
+        at different steps, so the padding past that point is not the row's
+        output and callers must slice it off.
         """
         self.eval()
-        stop = set(stop_tokens or ())
+        B = idx.shape[0]
         start = idx.shape[1]
         window = self.cfg.block_size
-        cache = KVCache(len(self.blocks)) if use_cache else None
-        logits, _ = self(idx[:, -window:], cache=cache)
+        device = idx.device
+        stop = (torch.tensor(sorted(set(stop_tokens)), device=device)
+                if stop_tokens else None)
+
+        cache = KVCache(len(self.blocks), max_len=window) if use_cache else None
+        if shared_prompt and cache is not None and B > 1:
+            logits, _ = self(idx[:1, -window:], cache=cache, last_only=True)
+            cache.expand_to(B)
+            # Materialized, not left as a stride-0 view: warp_logits writes
+            # into its logits in place.
+            logits = logits.expand(B, -1, -1).contiguous()
+        else:
+            logits, _ = self(idx[:, -window:], cache=cache, last_only=True)
+
+        # A row that has stopped keeps being stepped — the batch moves as one —
+        # but its length is pinned at the step it stopped, so whatever it emits
+        # afterwards is never read back.
+        done = torch.zeros(B, dtype=torch.bool, device=device)
+        lengths = torch.full((B,), max_new_tokens, dtype=torch.long, device=device)
         for step in range(max_new_tokens):
             warped = warp_logits(
                 logits[:, -1, :],
@@ -233,23 +285,27 @@ class MiniGPT(nn.Module):
                 frequency_penalty=frequency_penalty,
             )
             next_id = torch.multinomial(F.softmax(warped, dim=-1), num_samples=1)
-            if next_id.item() in stop:
-                break
+            if stop is not None:
+                hit = (next_id == stop).any(dim=-1)
+                lengths = torch.where(hit & ~done, step, lengths)
+                done |= hit
+                if bool(done.all()):
+                    break  # the stop token itself is never part of the output
             idx = torch.cat([idx, next_id], dim=1)
             if step == max_new_tokens - 1:
                 break  # nothing would read the next logits
             if cache is None:
-                logits, _ = self(idx[:, -window:])
+                logits, _ = self(idx[:, -window:], last_only=True)
             elif cache.n_past < window:
-                logits, _ = self(next_id, cache=cache)
+                logits, _ = self(next_id, cache=cache, last_only=True)
             else:
                 # Window full. Re-encode the trailing `window` tokens from
                 # scratch — exactly what the uncached loop does every step —
                 # so positions restart at 0 and RoPE is never asked to
                 # extrapolate past the context the model was trained on.
-                cache = KVCache(len(self.blocks))
-                logits, _ = self(idx[:, -window:], cache=cache)
-        return idx
+                cache = KVCache(len(self.blocks), max_len=window)
+                logits, _ = self(idx[:, -window:], cache=cache, last_only=True)
+        return (idx, lengths) if return_lengths else idx
 
 
 # ---------------------------------------------------- MiniGPT checkpoint I/O
@@ -279,6 +335,8 @@ def load_checkpoint(
     path: Path, device: str | None = None
 ) -> tuple[MiniGPT, CharTokenizer | BPETokenizer]:
     device = device or pick_device()
+    if device == "cpu":
+        configure_cpu()
     ckpt = torch.load(path, map_location=device, weights_only=True)
     model = MiniGPT(config_from_payload(ckpt["config"]))
     model.load_state_dict(ckpt["state_dict"])
@@ -345,42 +403,99 @@ class MiniChatLM:
             n = round(n * _CHAR_TOKEN_RATIO)
         return min(n, self.model.cfg.block_size // 2)
 
-    def generate_line(self, prompt: str, temperature: float = 0.8,
-                      max_new_tokens: int | None = None) -> str:
-        max_new = (self.max_new_tokens if max_new_tokens is None
-                   else self._budget(max_new_tokens))
+    def _prompt_ids(self, prompt: str, max_new: int) -> list[int]:
         ids = self.tokenizer.encode(prompt) or [self._newline_id]
         # Trim old context so prompt + reply fit in the block.
-        budget = self.model.cfg.block_size - max_new
-        ids = ids[-budget:]
-        idx = torch.tensor([ids], dtype=torch.long, device=self.device)
-        out = self.model.generate(
+        return ids[-(self.model.cfg.block_size - max_new):]
+
+    def generate_line(self, prompt: str, temperature: float = 0.8,
+                      max_new_tokens: int | None = None) -> str:
+        return self.generate_lines(prompt, [temperature], max_new_tokens)[0]
+
+    def generate_lines(self, prompt: str, temperatures: "Sequence[float]",
+                       max_new_tokens: int | None = None) -> list[str]:
+        """Sample one continuation of `prompt` per entry in `temperatures`, in a
+        single batched pass.
+
+        This is the batched form of `generate_line`, and the reason the chat
+        engine asks for its candidates all at once: decoding them one after
+        another reads the model's weights once per candidate for a single
+        token's worth of arithmetic each time, which is memory-bandwidth-bound
+        with the vector units idle. Sampled together they share one read of the
+        weights and the per-token matmuls become wide enough to keep SIMD busy
+        (see `MiniGPT.generate`). The candidates stay independent — same
+        distribution, same per-candidate temperature, just sampled side by side.
+        """
+        max_new = (self.max_new_tokens if max_new_tokens is None
+                   else self._budget(max_new_tokens))
+        ids = self._prompt_ids(prompt, max_new)
+        n = len(temperatures)
+        idx = torch.tensor([ids], dtype=torch.long,
+                           device=self.device).expand(n, -1).contiguous()
+        out, lengths = self.model.generate(
             idx,
             max_new_tokens=max_new,
-            temperature=temperature,
+            temperature=torch.tensor(list(temperatures), dtype=torch.float32,
+                                     device=self.device),
             top_k=_CHAT_TOP_K,
             top_p=_CHAT_TOP_P,
             repetition_penalty=_CHAT_REPETITION_PENALTY,
             stop_tokens=self._stop_ids,
+            shared_prompt=True,
+            return_lengths=True,
         )
-        return self.tokenizer.decode(out[0][len(ids) :].tolist()).strip()
+        start = len(ids)
+        return [
+            self.tokenizer.decode(out[b, start:start + int(lengths[b])].tolist()).strip()
+            for b in range(n)
+        ]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def logprob(self, context: str, continuation: str) -> float:
         """Mean per-token log-prob of `continuation` (as a full chat line)
         given `context`. Used for MMI relevance reranking."""
+        return self.logprob_batch(context, [continuation])[0]
+
+    @torch.inference_mode()
+    def logprob_batch(self, context: str, continuations: "Sequence[str]"
+                      ) -> list[float]:
+        """`logprob` for several continuations of one context, in one pass.
+
+        MMI scores every candidate twice — once against the conversation, once
+        against nothing — so a reply costs two of these calls per candidate.
+        They all share a context, which makes them a single padded batch: one
+        read of the weights instead of one per candidate.
+
+        Right-padding is safe because attention is causal, so a row's real
+        tokens cannot see the padding that follows them; the padded positions
+        are simply dropped from each row's mean.
+        """
         ctx = self.tokenizer.encode(context) or [self._newline_id]
         # Score the reply exactly as it appears in training: "B:" + " reply\n".
         # The leading space belongs to the first word's token (see build_prompt).
-        cont = self.tokenizer.encode(" " + continuation.strip() + "\n")
-        if not cont:
-            return float("-inf")
-        overflow = len(ctx) + len(cont) - self.model.cfg.block_size
+        conts = [self.tokenizer.encode(" " + c.strip() + "\n") for c in continuations]
+        width = max((len(c) for c in conts), default=0)
+        if not width:
+            return [float("-inf")] * len(conts)
+        # Trim to fit the longest candidate, so every candidate is scored
+        # against an identical context — which is what makes the scores
+        # comparable, and is the point of the exercise.
+        overflow = len(ctx) + width - self.model.cfg.block_size
         if overflow > 0:  # trim old context, never the continuation
             ctx = ctx[overflow:] or [self._newline_id]
-        ids = torch.tensor([ctx + cont], dtype=torch.long, device=self.device)
+        pad = self._newline_id
+        rows = [ctx + c + [pad] * (width - len(c)) for c in conts]
+        ids = torch.tensor(rows, dtype=torch.long, device=self.device)
         logits, _ = self.model(ids[:, :-1])
-        logprobs = F.log_softmax(logits[0], dim=-1)
-        targets = ids[0, len(ctx) :]
-        picked = logprobs[len(ctx) - 1 :].gather(1, targets.unsqueeze(1))
-        return float(picked.mean())
+        # logP(target) = logit[target] - logsumexp(logits), which avoids
+        # materializing a second (B, T, vocab) tensor for the log-softmax.
+        targets = ids[:, 1:]
+        picked = (logits.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+                  - logits.logsumexp(-1))
+        n = len(ctx)
+        scored = picked[:, n - 1:]  # the continuation's own positions
+        keep = (torch.arange(width, device=self.device)[None, :]
+                < torch.tensor([len(c) for c in conts], device=self.device)[:, None])
+        totals = (scored * keep).sum(-1) / keep.sum(-1).clamp_min(1)
+        return [float(t) if len(c) else float("-inf")
+                for t, c in zip(totals, conts)]

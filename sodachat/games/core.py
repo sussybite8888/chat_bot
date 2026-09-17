@@ -18,6 +18,7 @@ scripted `expert` for the training data — the pipeline does the rest.
 
 from __future__ import annotations
 
+import contextlib
 import random
 import string
 import time
@@ -412,8 +413,14 @@ class GamePlayer:
     def __init__(self, model, tok, device, warmup=32, single_thread=True):
         import torch
 
-        if device == "cpu" and single_thread:
-            torch.set_num_threads(1)
+        from ..blocks import cpu_threads
+
+        # Scoped to this player's own forward passes rather than set on the
+        # process: the thread count is global, but one thread is the right
+        # answer only for a model this small. A chat model in the same process
+        # wants every core, and used to lose them to this line.
+        self._threads = (lambda: cpu_threads(1)) if (device == "cpu" and single_thread) \
+            else contextlib.nullcontext
         self.model = model
         self.tok = tok
         self.device = device
@@ -433,9 +440,10 @@ class GamePlayer:
     def _warmup(self, n: int) -> None:
         import torch
 
-        for _ in range(max(n, 1)):
-            with torch.inference_mode():
-                self.model(self._buf)
+        with self._threads():
+            for _ in range(max(n, 1)):
+                with torch.inference_mode():
+                    self.model(self._buf)
         self._sync()
 
     def act(self, game: Game) -> str:
@@ -444,7 +452,7 @@ class GamePlayer:
         t0 = time.perf_counter()
         ids = self.tok.encode(game.observe())
         self._buf[0].copy_(torch.as_tensor(ids, dtype=torch.long))
-        with torch.inference_mode():
+        with self._threads(), torch.inference_mode():
             logits = self.model(self._buf)[0][0, -1]
         # Choose the highest-scoring *legal* action.
         legal = [
