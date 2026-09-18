@@ -28,8 +28,16 @@ visible to the whole channel, and a small model choosing them unprompted is a
 worse failure than a missed reaction — so they ship off, and
 `DISCORD_ALLOWED_ACTIONS` turns them on per server.
 
-`ping` is the one default-on act that is not reversible — a notification cannot
-be unsent. It is on anyway because it needs no elevated permission and because
+`ping` takes a name and will reach anyone in the server, which makes it the one
+act whose blast radius is not bounded by the conversation it happens in. What
+holds it in is not a fixed rule but a **borrowed** one: the bot may reach as
+far as the person who asked it to, and no further. Someone who can call a whole
+channel to order can ask the bot to do that; someone who cannot, cannot use the
+bot to get around it. The frontend then scopes `allowed_mentions` to exactly
+the person or role it resolved, so nothing broader rides along in the text.
+
+`ping` is also the one default-on act that is not reversible — a notification
+cannot be unsent. It is on anyway because it needs no elevated permission and because
 the alternative is worse: the model learned the word `@someone` from the corpus
 and will write it whether or not this tool exists, and grey text that addresses
 nobody is a bot that looks broken. With the tool, a mention leaves this process
@@ -136,6 +144,11 @@ class Tool:
     needs: str = ""   # permission required, for the "I couldn't" log line
     cap: int = 0      # Discord's length limit on the argument
     aliases: tuple[str, ...] = ()
+    # Whether the act still means something with the argument left off. True
+    # for `ping` alone: the argument names who to reach, and without one the
+    # frontend falls back to whoever the turn is about — which is a real
+    # request, not the malformed `[[react]]` that `clean_arg` drops.
+    optional: bool = False
 
 
 TOOLS: dict[str, Tool] = {
@@ -160,8 +173,10 @@ TOOLS: dict[str, Tool] = {
         Tool("thread", "name", "start a thread on the message",
              default_on=False, needs="Create Public Threads", cap=100),
         # --- people -------------------------------------------------------
-        Tool("ping", "", "ping whoever it is answering, for real",
-             default_on=True, needs="Send Messages", aliases=("mention",)),
+        Tool("ping", "name", "ping a person or role by name, or whoever it is "
+             "answering when given none",
+             default_on=True, needs="Send Messages", cap=100,
+             aliases=("mention",), optional=True),
         Tool("nick", "name", "change its own nickname in this server",
              default_on=False, needs="Change Nickname", cap=32),
         Tool("rename", "name", "rename whoever it is answering",
@@ -359,7 +374,8 @@ def clean_arg(tool: Tool, arg: str) -> str | None:
     if not tool.takes:
         return ""      # `[[pin]]` with something after it is still just a pin
     if not arg:
-        return None    # and `[[react]]` with nothing after it is not an act
+        # `[[react]]` with nothing after it is not an act — but `[[ping]]` is.
+        return "" if tool.optional else None
     if tool.takes == "emoji":
         return clean_emoji(arg)
     if tool.takes == "seconds":

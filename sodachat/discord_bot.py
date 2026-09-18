@@ -142,22 +142,189 @@ async def _act_say(message: discord.Message, arg: str, client: discord.Client) -
     _remember(await message.channel.send(arg))
 
 
-async def _act_ping(message: discord.Message, arg: str, client: discord.Client) -> None:
-    """Ping whoever the turn is about — a real mention, which notifies them.
+# Names that mean "everyone in here", and the `@here` half of them.
+_MASS_PING = {"everyone", "@everyone", "all", "@all", "here", "@here"}
+_HERE = {"here", "@here"}
 
-    The model cannot name anybody: mentions reach it as the bare word
-    "@someone" (discord_text.py), so the target comes off the message exactly
-    as it does for `rename` and `role`. `allowed_mentions` names that one
-    member and nobody else, so a stray `@everyone` in the argument — or in a
-    nickname — cannot turn this into a broadcast.
+
+def _ping_block(message: discord.Message, client: discord.Client) -> str | None:
+    """Whether a ping from this turn may reach @everyone, @here, or a role
+    nobody is allowed to mention.
+
+    **The bot borrows the asker's reach.** Not its own: a bot sitting on Manage
+    Server is holding more authority than most of the people talking to it, and
+    "the model decided to" is not a reason for a whole guild to get notified.
+    Not a fixed rule either, which was the previous answer and the wrong one —
+    a moderator asking the bot to call everyone in is asking for something they
+    could do themselves in the next message.
+
+    So the reach of an act is the reach of the person who asked for it,
+    intersected with what the bot can actually do (Discord enforces that half
+    regardless, and the intersection is what makes the failure legible instead
+    of the mention silently rendering as grey text).
+
+    Channel permissions rather than guild-wide ones, because a server that
+    takes @everyone away in #announcements has said something specific, and
+    `guild_permissions` would not hear it.
+
+    Returns None when the ping may go ahead, and otherwise the reason — which
+    side is short, named exactly. "I couldn't" is a log line somebody reads at
+    midnight, and "you can't" when it was really the bot that couldn't is how
+    an evening goes missing.
     """
-    member = _target(message, client)
-    _remember(await message.channel.send(
-        member.mention,
-        allowed_mentions=discord.AllowedMentions.none().merge(
-            discord.AllowedMentions(users=[member])
-        ),
-    ))
+    if message.guild is None:
+        return "there's nobody else here; this is a DM"
+    here = message.channel.permissions_for
+    if not (isinstance(message.author, discord.Member)
+            and here(message.author).mention_everyone):
+        return "you can't ping everyone in this channel, so neither can I"
+    if not here(message.guild.me).mention_everyone:
+        return ("you can, but I don't have Mention @everyone here — "
+                "give me the permission and ask again")
+    return None
+
+
+def _copied_from(message: str, name: str) -> str | None:
+    """`name` as the message actually spells it, or None if it isn't in there.
+
+    Naming a target is a *copying* task: the model reads a name out of the
+    message and puts it in the argument. So the copy can be checked, and it has
+    to be — the failure that matters is not a missed ping but a ping delivered
+    to the wrong person. A specialist asked to "give them a nudge" once
+    answered `[[ping greta]]`, a name from its training fillers and from
+    nobody's message; a server with a real Greta in it would have notified her.
+
+    An argument the message does not contain is therefore treated as no
+    argument at all, and the ping falls back to whoever the turn is about —
+    which is what a pronoun meant in the first place. Leading articles and the
+    handle-ish debris the model sometimes appends ("wei_" for "wei") are
+    tolerated, because those are spelling, not a different person.
+    """
+    haystack = message.lower()
+    candidate = name.lower().lstrip("@").strip()
+    for prefix in ("the ", "our ", "a "):
+        candidate = candidate.removeprefix(prefix)
+    if not candidate:
+        return None
+    if candidate in haystack:
+        return candidate
+    # "wei_", "wei42" -> "wei": trailing handle decoration the model added.
+    trimmed = candidate.rstrip("_0123456789").strip()
+    if len(trimmed) >= 3 and trimmed in haystack:
+        return trimmed
+    return None
+
+
+def _ping_role(message: discord.Message, name: str):
+    """A role in this guild by that name, or None. Roles need no privileged
+    intent — they arrive with the guild — which is why a role can be found by
+    name here while a member has to be asked for over the gateway.
+
+    The default role is returned like any other: it *is* @everyone, and whether
+    that may be pinged is `_may_ping`'s question, asked once at the call site
+    rather than twice here.
+    """
+    key = name.lower().removeprefix("the ").strip()
+    for role in message.guild.roles:
+        if role.name.lower().removeprefix("the ").strip() == key:
+            return role
+    return None
+
+
+async def _ping_member(message: discord.Message, name: str):
+    """A member of this guild whose name or nickname starts with `name`.
+
+    `query_members` is a gateway request rather than a cache read, which is the
+    only reason this works: the member cache is empty without the privileged
+    Server Members intent that this bot deliberately does not ask for (see
+    `_target`), but a *query* for a named handful is allowed without it. The
+    people already mentioned on the message are checked first because they cost
+    nothing and are the likeliest answer.
+    """
+    key = name.lower().lstrip("@").strip()
+    for user in message.mentions:
+        if isinstance(user, discord.Member) and key in (
+                user.name.lower(), (user.nick or "").lower(),
+                user.display_name.lower()):
+            return user
+    try:
+        found = await message.guild.query_members(query=key, limit=5)
+    except (discord.HTTPException, asyncio.TimeoutError):
+        return None
+    exact = [m for m in found if key in (m.name.lower(), m.display_name.lower())]
+    return (exact or found or [None])[0]
+
+
+async def _act_ping(message: discord.Message, arg: str, client: discord.Client) -> None:
+    """Ping a person or a role — by name when the model named one, and
+    otherwise whoever the turn is about.
+
+    The model reads names out of the message text ("tag the mods"), never out
+    of a mention: those reach it as the bare word "@someone" with the id
+    stripped (discord_text.py). So an argument here is always a name a human
+    typed, which is what makes resolving it against the server reasonable
+    rather than a guess.
+
+    How far it may reach is `_may_ping`: the asker's own permission in this
+    channel, intersected with the bot's. Someone who can call the room to
+    order can ask the bot to do it; someone who can't, can't borrow the bot to
+    get around that.
+
+    `allowed_mentions` names the one member or role that was resolved and
+    nothing else, so whatever is in the text — a nickname containing
+    "@everyone", a second name the model appended — cannot widen the ping
+    beyond what was looked up.
+    """
+    def only(**who) -> discord.AllowedMentions:
+        """`allowed_mentions` naming one recipient and nothing else.
+
+        Built from `none()` rather than by passing a single field, because an
+        `AllowedMentions` field left unset is not False — it is a truthy
+        sentinel, and `AllowedMentions(users=[member]).to_dict()` comes back
+        as `parse: ['everyone', 'roles']`. The body this sends is only the
+        mention itself, so nothing else is *there* to be honoured today; the
+        floor matters anyway, because the first person to put a word of the
+        model's text in this message would be shipping a mass-ping bug.
+        """
+        return discord.AllowedMentions.none().merge(
+            discord.AllowedMentions(**who))
+
+    if message.guild is None:
+        if arg.strip():
+            raise _CantAct("there's nobody else here to ping; this is a DM")
+        target = message.author
+        mentions = only(users=[target])
+    elif not (name := _copied_from(message.content, arg) or ""):
+        # Either the model named nobody, or it named somebody this message
+        # never mentioned (see `_copied_from`). Both mean the same thing here.
+        target = _target(message, client)     # whoever the turn is about
+        mentions = only(users=[target])
+    elif name.lower() in _MASS_PING:
+        if (why := _ping_block(message, client)) is not None:
+            raise _CantAct(why)
+        # @everyone and @here are not roles to be listed in `allowed_mentions`;
+        # they are the one `parse` flag that covers both, and the text decides
+        # which of the two fires.
+        text = "@here" if name.lower() in _HERE else "@everyone"
+        _remember(await message.channel.send(
+            text, allowed_mentions=only(everyone=True)))
+        return
+    elif (role := _ping_role(message, name)) is not None:
+        if role == message.guild.default_role:      # the @everyone role by name
+            if (why := _ping_block(message, client)) is not None:
+                raise _CantAct(why)
+            _remember(await message.channel.send(
+                "@everyone", allowed_mentions=only(everyone=True)))
+            return
+        if not role.mentionable and (
+                why := _ping_block(message, client)) is not None:
+            raise _CantAct(f"{role.name!r} can't be mentioned freely — {why}")
+        target, mentions = role, only(roles=[role])
+    elif (member := await _ping_member(message, name)) is not None:
+        target, mentions = member, only(users=[member])
+    else:
+        raise _CantAct(f"I can't find anyone here called {name!r}")
+    _remember(await message.channel.send(target.mention, allowed_mentions=mentions))
 
 
 async def _act_delete(message: discord.Message, arg: str,

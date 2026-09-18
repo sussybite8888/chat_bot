@@ -121,21 +121,99 @@ def doc(message: str, actions: "tuple[Action, ...]") -> str:
 _WHEN = ("the build finishes", "it's done", "the run ends", "you're finished",
          "training completes", "the deploy lands", "that finishes", "it works",
          "you figure it out", "the tests pass", "it's ready", "you get there")
-_WHO = ("him", "her", "them", "bob", "the mods", "@someone", "that guy",
-        "everyone in here", "the others", "whoever wrote this")
+# Two kinds of "who", and the difference is the whole lesson for `[[ping]]`'s
+# argument. A *name* can be looked up in the server, so it belongs in the call:
+# "tag the mods" -> `[[ping the mods]]`. A *pronoun* refers to the conversation
+# rather than the member list — there is nobody in any guild called "him" — so
+# it belongs nowhere, and the call goes out bare for the frontend to resolve
+# against whoever the turn is about. Teaching both under one filler would teach
+# the model to put "him" in the argument and the ping would find nobody.
+# The named pool is generated rather than listed, and it is deliberately huge.
+# A first pass used fourteen names and the specialist learned *them*: asked to
+# "shout at the moderators", it answered `[[ping the mod team]]` — a filler it
+# had memorized, not the name in front of it. Putting a name in the argument is
+# a copying task, and a model can only be forced to copy by making memorizing
+# useless. Thousands of distinct names, most seen once, do that.
+_FIRST = ("priya", "hendrik", "wei", "amara", "tomas", "lena", "kofi", "sana",
+          "dmitri", "yuki", "rosa", "olu", "ingrid", "hassan", "mei", "ravi",
+          "bob", "alice", "dave", "sam", "jamie", "chris", "riley", "noor",
+          "ana", "luca", "freya", "mateo", "zane", "iris", "otto", "nadia",
+          "pablo", "greta", "hugo", "leila", "marcus", "elena", "jonas", "tara",
+          "quinn", "vik", "bea", "soren", "maya", "felix", "ines", "aki")
+_HANDLE_SUFFIX = ("", "", "", "_", "42", "88", "2000", "_dev", "xx", "99",
+                  "_irl", "1234", "_tv", "07")
+_ROLE_QUALIFIER = ("", "", "the ", "the ", "our ", "design ", "backend ",
+                   "on-call ", "night ", "senior ", "core ", "new ", "server ")
+_ROLE_NOUN = ("mods", "admins", "devs", "reviewers", "organisers", "team",
+              "crew", "mod team", "support", "testers", "regulars", "staff",
+              "maintainers", "artists", "writers", "players", "helpers")
+
+
+def _name_pool() -> tuple[str, ...]:
+    """Every name the templates may ask for: people, handles and roles."""
+    people = list(_FIRST)
+    handles = [f"{n}{suffix}" for n in _FIRST for suffix in _HANDLE_SUFFIX if suffix]
+    roles = [f"{q}{noun}" for q in _ROLE_QUALIFIER for noun in _ROLE_NOUN]
+    return tuple(dict.fromkeys(people + handles + roles))
+
+
+_WHO_NAMED = _name_pool()
+_WHO_PRONOUN = ("him", "her", "them", "that guy", "the others",
+                "whoever wrote this", "whoever said that")
+_WHO = _WHO_NAMED + _WHO_PRONOUN
 _THING = ("this", "that", "this message", "that one", "it")
 _NAME = ("standup", "bug hunt", "the snake thread", "planning", "random",
          "deploy chat", "help", "oracle talk")
 
-# --- requests that want a ping ------------------------------------------
-_PING = (
+# --- requests that want a ping, with nobody to name ---------------------
+# The speaker wants reaching, or the target is a pronoun the member list cannot
+# answer. Either way the call goes out bare and the frontend resolves it.
+_PING_SELF = (
     "ping me when {when}", "ping me once {when}", "@ me when {when}",
     "let me know when {when}", "tell me when {when}", "notify me when {when}",
     "give me a shout when {when}", "ping me if {when}", "hit me up when {when}",
-    "can you ping {who}", "ping {who}", "tag {who}", "can you tag {who}",
-    "get {who}'s attention", "summon {who}", "call {who} in here",
-    "ping {who} for me", "would you tag {who}", "mention {who}",
-    "@ {who} please", "ping me", "tag me when {when}", "@ me",
+    "ping me", "tag me when {when}", "@ me", "buzz me when {when}",
+    "can you ping {pronoun}", "ping {pronoun}", "tag {pronoun}",
+    "get {pronoun}'s attention", "summon {pronoun}", "ping {pronoun} for me",
+)
+
+# --- requests that call the whole room ----------------------------------
+# Whether these are *allowed* is not the model's business: the frontend gives
+# the bot the asker's own reach and no more (`discord_bot._ping_block`), so a
+# request from someone who cannot call the room is refused there. The model's
+# job is only to notice that calling the room is what was asked for — and if it
+# could not ask, the permission the frontend so carefully checks would never
+# come up.
+_PING_ALL = (
+    "ping everyone about {when}", "let everyone know {when}",
+    "tell everyone {when}", "@ everyone about this", "ping everyone",
+    "let everyone in the server know", "tell everyone in this channel",
+    "@ here", "get everyone's attention", "call everyone in",
+    "ping everyone in the room", "announce this to everyone",
+    "@ everyone please", "everyone needs to see this", "@ here please",
+)
+
+# The same rule the other tools follow, for the same reason: the frontend
+# checks that the argument was copied out of the message
+# (`discord_bot._copied_from`), so a template whose call says "everyone" while
+# its message says "the whole server" would be quietly demoted to a ping of
+# whoever asked. Phrasings that mean everyone without saying it are therefore
+# not here — not because they are unnatural, but because this path cannot carry
+# them honestly.
+for _t in _PING_ALL:
+    assert "everyone" in _t or "here" in _t, (
+        f"{_t!r}: the word the call copies must be in the message")
+
+# --- requests that name who to reach ------------------------------------
+# The name goes in the argument, verbatim as the message gave it: the frontend
+# matches it against the guild's roles and then its members, so "the mods"
+# wants to arrive as "the mods" rather than as anything cleverer.
+_PING_NAMED = (
+    "can you ping {named}", "ping {named}", "tag {named}", "can you tag {named}",
+    "get {named}'s attention", "summon {named}", "call {named} in here",
+    "ping {named} for me", "would you tag {named}", "mention {named}",
+    "@ {named} please", "let {named} know", "tell {named} about this",
+    "someone should ping {named}", "give {named} a shout",
 )
 
 # --- the near misses, which must stay quiet -----------------------------
@@ -151,6 +229,17 @@ _NOT_PING = (
     "please never @ everyone again", "who pinged me", "that was a mass ping",
     "i hate being tagged", "you got tagged in that thread",
     "don't tag {who} for this", "stop @ing people", "no pings please",
+    # The whole-room negations. These matter more than the rest of the list:
+    # the permission check downstream stops someone who *cannot* call the room,
+    # which is exactly the wrong half of the problem here — a moderator saying
+    # "don't tell everyone about it" is someone who can, asking not to.
+    "dont tell everyone about it", "don't tell everyone", "don't ping everyone",
+    "no need to tell everyone", "please don't @ everyone", "everyone is asleep",
+    "not everyone needs to see this", "don't announce this to everyone",
+    "keep this from everyone", "stop pinging everyone", "everyone already knows",
+    "i don't want to bother everyone", "everyone saw it already",
+    "let's not @ here for this", "no @ here please", "don't wake everyone up",
+    "everyone left already", "is everyone still here",
 )
 
 # --- the other tools, in the phrasing a request actually arrives in ------
@@ -199,6 +288,7 @@ for _tool, _templates in _REQUESTS.items():
 def _fill(rng: np.random.Generator, template: str) -> tuple[str, dict]:
     """A template with its slots filled, plus what went into them."""
     slots = {"when": rng.choice(_WHEN), "who": rng.choice(_WHO),
+             "named": rng.choice(_WHO_NAMED), "pronoun": rng.choice(_WHO_PRONOUN),
              "thing": rng.choice(_THING), "name": rng.choice(_NAME)}
     return template.format(**slots), slots
 
@@ -213,10 +303,21 @@ def _synthetic(rng: np.random.Generator,
     other tools), and mixing them first would let that accident set the blend.
     """
     ping, other, negative = [], [], []
-    for template in _PING:
+    for template in _PING_SELF:
         for _ in range(per_template):
             text, _ = _fill(rng, template)
             ping.append(doc(text, (Action("ping"),)))
+    for template in _PING_ALL:
+        for _ in range(per_template):
+            text, _ = _fill(rng, template)
+            # The argument is the word the message used, so `_copied_from`
+            # can check it the same way it checks a name.
+            everyone = "here" if "@ here" in text else "everyone"
+            ping.append(doc(text, (Action("ping", everyone),)))
+    for template in _PING_NAMED:
+        for _ in range(per_template):
+            text, slots = _fill(rng, template)
+            ping.append(doc(text, (Action("ping", slots["named"]),)))
     for template in _NOT_PING:
         for _ in range(per_template):
             text, _ = _fill(rng, template)
@@ -462,13 +563,18 @@ def available(lm: ExpertLM) -> bool:
     return NAME in getattr(lm, "specialists", {})
 
 
-def suggest(lm: ExpertLM, message: str, temperature: float = 0.2,
+def suggest(lm: ExpertLM, message: str, temperature: float = 0.05,
             max_new_tokens: int = 24) -> tuple[Action, ...]:
     """The acts a message warrants, as the specialist reads it.
 
-    Sampled cold (temperature 0.2) on purpose. This is a decision, not prose:
-    the interesting failure is a ping nobody asked for, and there is nothing to
-    be gained from the model being surprising about whether to notify someone.
+    Sampled nearly greedily (temperature 0.05) on purpose. This is a decision,
+    not prose: there is nothing to be gained from the model being surprising
+    about whether to notify someone, and something to lose. Measured over ten
+    samples each, 0.2 answered "tag the mods" with `[[ping the mods]]` five
+    times and a bare `[[ping]]` the other five — the same message pinging a
+    different person depending on the roll. At 0.05 and below it is 10/10, and
+    the calls it is confident about (`[[ping priya]]`) never wavered at any
+    setting, so the cold sampling costs nothing it was getting right.
 
     Unknown names — `[[none]]` above all — are dropped by `actions.parse`, so
     "nothing to do" needs no special case here.
