@@ -6,7 +6,9 @@ to two uses that lean on its speed and small size:
 - **A chatbot** with a terminal UI, a Discord bot, a Google Chat app, and a
   browser page sharing one engine. The bots share one *loaded* copy of it too,
   through a small API server that holds the models (see
-  [One model, many bots](#one-model-many-bots)); the browser page skips the
+  [One model, many bots](#one-model-many-bots)), which also speaks the OpenAI
+  and Anthropic wire formats so any client can point at it (see
+  [Speaking OpenAI and Anthropic](#speaking-openai-and-anthropic)); the browser page skips the
   server entirely and runs the model client-side via ONNX Runtime Web (see
   [In the browser](#in-the-browser-onnx-runtime-web)).
 - **A game controller** — the same architecture, small enough to pick an
@@ -423,6 +425,17 @@ of the checkpoints — behind five endpoints:
 | `GET /v1/rooms` | the live conversations |
 | `POST /v1/rooms/reset` | forget one room (or all of them) |
 
+and the same models behind the two wire formats everything else already speaks
+([compat.py](sodachat/compat.py)), so an editor plugin or an SDK can point
+straight at it — [Speaking OpenAI and Anthropic](#speaking-openai-and-anthropic):
+
+| | |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI, streaming or not |
+| `POST /v1/messages` | Anthropic, streaming or not |
+| `POST /v1/messages/count_tokens` | |
+| `GET /v1/models` | both dialects, one body |
+
 Rooms are namespaced by the frontend that owns them — `discord:123`,
 `googlechat:spaces/AAA` — because one server now holds every bot's
 conversations, and two transports' ids are not from the same space. Each still
@@ -525,6 +538,97 @@ model for whoever reaches it. To serve bots on other machines, set
 `X-API-Key: <key>` or `Authorization: Bearer <key>`, and the clients send it —
 and bind with `--host 0.0.0.0` (the server warns if you do the second without
 the first). Run it behind TLS if it leaves the machine.
+
+### Speaking OpenAI and Anthropic
+
+The native API is shaped like what this server is — a room, a message, a reply,
+and the acts that reply wants taken in that room. That is the right shape for a
+bot and the wrong shape for everything else, and everything else already knows
+two other shapes. So the same models sit behind those too
+([compat.py](sodachat/compat.py)):
+
+```sh
+curl -s localhost:8765/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"sodachat","messages":[{"role":"user","content":"hey there"}]}'
+# -> {"object":"chat.completion","choices":[{"message":{"role":"assistant",
+#     "content":"Hey! How are you doing?"},"finish_reason":"stop"}], ...}
+
+curl -s localhost:8765/v1/messages -H 'Content-Type: application/json' \
+  -d '{"model":"sodachat","max_tokens":512,"messages":[{"role":"user","content":"hello!"}]}'
+# -> {"type":"message","role":"assistant",
+#     "content":[{"type":"text","text":"Hello! How are you today?"}], ...}
+```
+
+Both SDKs work unmodified, streaming included. **Note the two base URLs**: the
+`openai` client appends `/chat/completions` to a base that already ends in
+`/v1`, while `anthropic` appends the whole `/v1/messages` to the root. Same
+server, same port, different convention — an easy 404 to lose an hour to.
+
+```python
+from openai import OpenAI
+from anthropic import Anthropic
+
+oai = OpenAI(base_url="http://localhost:8765/v1", api_key="unused")
+ant = Anthropic(base_url="http://localhost:8765", api_key="unused")
+
+oai.chat.completions.create(model="sodachat",
+                            messages=[{"role": "user", "content": "hey"}])
+ant.messages.create(model="sodachat", max_tokens=512,
+                    messages=[{"role": "user", "content": "hey"}])
+```
+
+Any `model` string is accepted and echoed back rather than 404'd — there is one
+model here, and clients hardcode `gpt-4o-mini` in places you cannot always
+reach. The api key is whatever `SODACHAT_API_KEY` is set to, and anything at all
+when it isn't: both SDKs already send one of the two headers the server's own
+auth reads, so neither needs special handling.
+
+Images work in both dialects — OpenAI `image_url` content parts and Anthropic
+`image` blocks both land in the room's sandbox as attachments and reach `/see`,
+exactly like a file dropped in a terminal. Only `data:` URLs; a remote URL is
+skipped rather than fetched, because fetching one would make this server issue
+requests on behalf of whoever can reach the port.
+
+**Stateless over stateful.** Both APIs make the client hold the conversation
+and resend it every request; a room here is a `SodaAgent` with a history, a
+running game, a persona and a sandbox. Replaying the whole history through the
+model each turn would cost one decode per prior turn and throw all of that away,
+so the history is used as an *identity* instead. After answering, the server
+fingerprints the conversation including the reply it just gave; the next request
+carries exactly that plus one new turn, so it hashes back to the same room and
+only the new turn has to be answered:
+
+```
+turn 1   [u1]                   miss -> new room R
+         answer a1                   -> file fingerprint([u1, a1]) = R
+turn 2   [u1, a1, u2]           hit  -> R, and only u2 is generated
+```
+
+A miss is the other half of the design, not a failure: a client that branched
+the conversation, edited an earlier turn, or is simply new gets a fresh room
+**seeded** with the history it sent — replayed, never re-generated. So an
+OpenAI-shaped conversation keeps its game and its persona across turns, and
+nothing breaks when it doesn't. The table is bounded (256 conversations) and
+evicts least-recently-used, resetting the room it drops.
+
+`/v1/rooms` lists these alongside the bots' as `compat:<id>`, and
+`POST /v1/rooms/reset` forgets them the same way.
+
+**What they deliberately don't carry.** A compatible shape that quietly means
+something else is worse than a missing feature, so:
+
+| | |
+|---|---|
+| actions | dropped — `[[react :kekw:]]` is an act for a frontend that owns a room, and an HTTP client has no room to react in. The text comes back clean |
+| `temperature`, `top_p`, `max_tokens`, `n` | accepted and ignored. Length and sampling belong to the room's persona ([personality](#personality)), not to a stranger's request |
+| `stop` / `stop_sequences` | **honoured** — it is truncation of a finished reply, so it costs nothing to get right |
+| `usage` counts | estimates from character length, not the tokenizer that ran. Right order of magnitude, not a billing record |
+| a system prompt | becomes the conversation's opening turn. The agent has no system-prompt channel — persona is `/persona`, length is `/length` — so it is context rather than an instruction with authority |
+| streaming | generates first, then streams. `Rooms.reply` returns a whole reply and there is no token callback to tap, so the stream opens immediately (nothing times out waiting for a first byte) and the finished reply goes out in word-sized deltas. Every event arrives in the right order; the text just isn't live |
+
+The agent is still the agent underneath: `/help`, `/play snake` and the rest
+route exactly as they do in a chat room, so an OpenAI client is another way to
+talk to the same bot rather than a reduced one.
 
 ## Discord
 
@@ -1638,6 +1742,9 @@ sodachat/
   rooms.py        # the model side of a chat room: one agent per room over one set
                   #   of checkpoints, attachment staging, per-room reset
   api.py          # MASTER API SERVER: holds the models, serves every bot
+  compat.py       # the same models behind the OpenAI and Anthropic wire formats:
+                  #   /v1/chat/completions and /v1/messages, streaming included,
+                  #   with a stateless history mapped onto a stateful room
   client.py       # the other end — remote (HTTP) or in-process, same reply()
   files.py        # which files the agent may open AND write: per-room sandbox for
                   #   bots, unrestricted reads only for the terminal the user owns,

@@ -38,8 +38,23 @@ Endpoints
     GET  /v1/rooms               the live conversations
     POST /v1/rooms/reset         {room} -> forget one room (or all of them)
 
+and the same models behind the two wire formats everything else already speaks
+([compat.py](compat.py)) — so an editor plugin, an eval harness or the `openai`
+and `anthropic` SDKs can point at this server with no adapter in between:
+
+    POST /v1/chat/completions    OpenAI
+    POST /v1/messages            Anthropic
+    POST /v1/messages/count_tokens
+    GET  /v1/models
+
+Those are a translation layer over `Rooms.reply` and nothing more — the rooms,
+the sandbox and the generation lock are shared with the native routes. What they
+deliberately don't carry (actions, sampling parameters, exact token counts) is
+listed in compat.py rather than implied here.
+
 Set `SODACHAT_API_KEY` and every route but /healthz requires it, as
-`X-API-Key: <key>` or `Authorization: Bearer <key>`. Bind to 127.0.0.1 (the
+`X-API-Key: <key>` or `Authorization: Bearer <key>`. Both SDKs already send one
+of those two headers, so neither needs special handling. Bind to 127.0.0.1 (the
 default) unless the key is set: this endpoint runs a model for whoever asks.
 """
 
@@ -57,6 +72,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from .compat import install as install_compat
 from .transport import MAX_ATTACHMENT_BYTES, Attachment, api_key, filtered_enabled
 
 log = logging.getLogger("sodachat.api")
@@ -248,8 +264,25 @@ async def reset(request: ResetRequest) -> dict:
     if request.room is None:
         count = len(live.rooms())
         live.stop()
+        # The compat endpoints remember which room a stateless conversation
+        # belongs to (compat.py). Those rooms are gone now, so the mapping has
+        # to go with them — kept, it would send the next turn of an OpenAI-shaped
+        # conversation into a room that had just been emptied, which reads as
+        # amnesia rather than as the reset it was.
+        compat.conversations.clear()
         return {"reset": count}
+    compat.conversations.forget(request.room)
     return {"reset": int(live.reset(request.room))}
+
+
+# ------------------------------------------------- the OpenAI/Anthropic shapes
+#
+# Installed last, so the native routes above are what this module reads as its
+# own. `_ready` and `_authorize` are handed over rather than imported back:
+# there is one lifespan holding the models and one shared-secret check, and a
+# second copy of either is how the two surfaces drift apart.
+
+compat = install_compat(app, _ready, _authorize)
 
 
 # -------------------------------------------------------------------- main

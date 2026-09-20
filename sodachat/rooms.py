@@ -135,6 +135,26 @@ class Rooms:
         """The rooms this server is holding a conversation with."""
         return sorted(self._agents if self.agent_mode else self._histories)
 
+    def seed(self, room: str, history: Sequence[str]) -> None:
+        """Give a room a past it didn't live through.
+
+        The chat-room frontends never need this: a room accumulates its history
+        one answered turn at a time. The OpenAI- and Anthropic-shaped endpoints
+        ([compat.py](compat.py)) do, because those APIs are stateless — the
+        client resends the whole conversation every request — so a history this
+        server has no room for has to be *replayed* rather than re-generated.
+        Generating the assistant's old turns again would cost one decode per
+        turn and produce different words than the client already has.
+
+        `history` is flat and alternating — user, assistant, user, ... — which
+        is how both the agent and the plain-chat engine already store it, so
+        seeding is an assignment rather than a translation.
+        """
+        if not self.agent_mode:
+            self._histories[room] = deque(history, maxlen=_PLAIN_HISTORY)
+            return
+        self.agent(room).history = list(history)
+
     def reset(self, room: str) -> bool:
         """Forget a room: its history, its persona, and any game it left
         running. True if there was anything to forget."""
